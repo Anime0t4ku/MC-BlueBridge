@@ -1,6 +1,7 @@
 #include "usb_device.h"
 #include "usb_descriptors.h"
 #include "xinput_device.h"
+#include "hid_feedback.h"
 #include "cdc_protocol.h"
 #include "bt_host.h"
 #include "pico/multicore.h"
@@ -165,6 +166,7 @@ static void handle_reenumeration(void) {
     if (!requested) return;
     usb_mounted = false;
     bb_state_set_usb_ready(false);
+    bb_feedback_reset();
     tud_disconnect();
     sleep_ms(120);
     switch_last_send = 0;
@@ -176,6 +178,7 @@ void bb_usb_core1(void) {
     critical_section_init(&usb_lock);
     tusb_init();
     while (true) {
+        if (bb_output_mode() == BB_OUTPUT_MISTER) bb_feedback_poll(to_ms_since_boot(get_absolute_time()));
         tud_task();
         bb_cdc_poll();
         handle_reenumeration();
@@ -186,6 +189,7 @@ void bb_usb_core1(void) {
 }
 
 void tud_mount_cb(void) {
+    bb_feedback_reset();
     usb_mounted = true;
     bb_state_set_usb_ready(true);
     critical_section_enter_blocking(&usb_lock);
@@ -194,12 +198,14 @@ void tud_mount_cb(void) {
 }
 
 void tud_umount_cb(void) {
+    bb_feedback_reset();
     usb_mounted = false;
     bb_state_set_usb_ready(false);
 }
 
 void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
+    bb_feedback_stop();
 }
 
 void tud_resume_cb(void) {
@@ -208,20 +214,19 @@ void tud_resume_cb(void) {
 }
 
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
-    (void)instance;
-    (void)report_id;
-    (void)report_type;
-    (void)buffer;
-    (void)reqlen;
-    return 0;
+    if (instance != 0 || bb_output_mode() != BB_OUTPUT_MISTER) return 0;
+    return bb_feedback_get(report_id, report_type == HID_REPORT_TYPE_FEATURE, buffer, reqlen);
 }
 
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
-    (void)instance;
-    (void)report_type;
-    (void)report_id;
-    (void)buffer;
-    (void)bufsize;
+    if (instance != 0 || bb_output_mode() != BB_OUTPUT_MISTER || !buffer) return;
+    if (report_type != HID_REPORT_TYPE_OUTPUT && report_type != HID_REPORT_TYPE_FEATURE) return;
+    if (!report_id) {
+        if (!bufsize) return;
+        report_id = *buffer++;
+        --bufsize;
+    }
+    bb_feedback_set(report_id, report_type == HID_REPORT_TYPE_FEATURE, buffer, bufsize);
 }
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request) {

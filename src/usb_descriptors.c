@@ -46,6 +46,12 @@ static uint8_t const gamepad_report_desc[] = {
     TUD_HID_REPORT_DESC_GAMEPAD(HID_REPORT_ID(REPORT_ID_GAMEPAD))
 };
 
+static uint8_t const pid_report_desc[] = {
+#include "pid_report_descriptor.h"
+};
+
+static uint8_t mister_report_desc[sizeof(gamepad_report_desc) + sizeof(pid_report_desc)];
+
 static uint8_t const switch_report_desc[] = {
     0x05,0x01,0x09,0x05,0xa1,0x01,
     0x05,0x09,0x19,0x01,0x29,0x10,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x10,0x81,0x02,
@@ -71,6 +77,12 @@ static const uint8_t hid_config_desc[] = {
     TUD_HID_DESCRIPTOR(COMPOSITE_ITF_GAMEPAD, 5, HID_ITF_PROTOCOL_NONE, sizeof(gamepad_report_desc), 0x83, 16, 1)
 };
 
+static const uint8_t mister_config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, COMPOSITE_ITF_TOTAL, 0, COMPOSITE_CONFIG_LEN, 0, 100),
+    TUD_CDC_DESCRIPTOR(COMPOSITE_ITF_CDC, 4, 0x81, 8, 0x02, 0x82, 64),
+    TUD_HID_DESCRIPTOR(COMPOSITE_ITF_GAMEPAD, 5, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x83, 16, 1)
+};
+
 static const uint8_t switch_config_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 3, 0, SWITCH_CONFIG_LEN, 0x20, 500),
     TUD_HID_INOUT_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_NONE, sizeof(switch_report_desc), 0x01, 0x81, 64, 4),
@@ -89,6 +101,7 @@ static const uint8_t xinput_config_desc[] = {
 uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
     (void)index;
     bb_output_mode_t mode = bb_output_mode();
+    if (mode == BB_OUTPUT_MISTER) return mister_config_desc;
     if (mode == BB_OUTPUT_XINPUT) return xinput_config_desc;
     if (mode == BB_OUTPUT_SWITCH) return switch_config_desc;
     return hid_config_desc;
@@ -96,7 +109,14 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
 
 uint8_t const* tud_hid_descriptor_report_cb(uint8_t instance) {
     (void)instance;
-    return bb_output_mode() == BB_OUTPUT_SWITCH ? switch_report_desc : gamepad_report_desc;
+    if (bb_output_mode() == BB_OUTPUT_SWITCH) return switch_report_desc;
+    if (bb_output_mode() == BB_OUTPUT_MISTER) {
+        memcpy(mister_report_desc, gamepad_report_desc, sizeof(gamepad_report_desc) - 1);
+        memcpy(mister_report_desc + sizeof(gamepad_report_desc) - 1, pid_report_desc, sizeof(pid_report_desc));
+        mister_report_desc[sizeof(mister_report_desc) - 1] = 0xc0;
+        return mister_report_desc;
+    }
+    return gamepad_report_desc;
 }
 
 static uint16_t str_desc[64];

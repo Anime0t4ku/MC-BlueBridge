@@ -28,6 +28,7 @@ add_executable(mc_bluebridge
   src/bt_host.c
   src/controller_input.c
   src/controller_driver.c
+  src/hid_feedback.c
   src/xinput_device.c
   src/usb_device.c
   src/usb_descriptors.c
