@@ -44,14 +44,6 @@ Profiles can optionally share the same MiSTer mapping when the user wants multip
 
 The controller's native VID/PID and Bluetooth identity are used internally by BlueBridge for identification and compatibility handling. BlueBridge presents its own USB identity to MiSTer.
 
-## Profiles and controls
-
-Profiles belong to remembered controllers and keep their own button mapping, analog tuning, turbo settings, macros, and MiSTer identity. Button names are presented using the connected controller's native naming scheme when BlueBridge can identify it.
-
-Profile mappings can target normal controller buttons, Macro 1 through Macro 4, Turbo Toggle, Turbo Hold, or Disabled. Macros define virtual button combinations and can be assigned to any physical button. Turbo can use a dedicated virtual control, or automatically fall back to a configurable modifier layer on controllers without a spare button.
-
-Companion Remote is optional. BlueBridge continues to handle controller input and profiles when the daemon is unavailable.
-
 ## LED states
 
 - Solid: controller connected
