@@ -221,7 +221,7 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     static const char* nintendo[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Minus","Plus","L Stick","R Stick","Home","Capture","GL","GR","L4","R4","L5","R5","P1","P2","P3","P4","Aux 1","Aux 2"};
     static const char* switch2[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Minus","Plus","L Stick","R Stick","Home","Capture","GL","GR","C","L4","R4","L5","P1","P2","P3","P4","Aux 1","Aux 2"};
     static const char* stadia[BB_BUTTON_COUNT] = {"A","B","X","Y","L1","R1","L2","R2","Options","Menu","L3","R3","Stadia","Capture","Assistant","Extra","L4","R4","L5","R5","P1","P2","P3","P4","Aux 1","Aux 2"};
-    static const char* n64[BB_BUTTON_COUNT] = {"A","B","C Left","C Right","L","R","Z","C Down","Minus","Start","Stick","C Up","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
+    static const char* n64[BB_BUTTON_COUNT] = {"A","B","C Left","C Right","L","R","Z","C Down","Unused","Start","ZR","C Up","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
     static const char* snes[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Select","Start","L Stick","R Stick","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
     static const char* nes[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Select","Start","L Stick","R Stick","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
     static const char* genesis[BB_BUTTON_COUNT] = {"B","C","A","X","Y","Z","L","R","Mode","Start","L Stick","R Stick","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
@@ -293,7 +293,7 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
             c.right_trigger = 0;
             break;
         case BB_CONTROLLER_NSO_N64:
-            c.buttons = 0x00003fffu;
+            c.buttons = 0x00003effu;
             c.right_stick = 0;
             c.right_trigger = 0;
             break;

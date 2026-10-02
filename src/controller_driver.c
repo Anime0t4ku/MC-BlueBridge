@@ -29,6 +29,9 @@ static bool eightbitdo_axis_roles_ready;
 static uint32_t switch2_cal_sum[4];
 static uint16_t switch2_cal_center[4];
 static uint8_t switch2_cal_samples;
+static uint16_t n64_center[2] = {2048, 2048};
+static uint16_t n64_below[2] = {2047, 2047};
+static uint16_t n64_above[2] = {2047, 2047};
 
 static void submit_state(const bb_input_state_t* state) {
     if (!state) return;
@@ -236,6 +239,60 @@ static uint16_t unpack12a(const uint8_t* p) {
 
 static uint16_t unpack12b(const uint8_t* p) {
     return (uint16_t)((p[1] >> 4) | (p[2] << 4));
+}
+
+bool bb_driver_set_n64_calibration(const uint8_t* data, uint16_t length) {
+    if (!data || length < 9 || identity.kind != BB_CONTROLLER_NSO_N64) return false;
+    uint16_t above[2] = {unpack12a(data), unpack12b(data)};
+    uint16_t center[2] = {unpack12a(data + 3), unpack12b(data + 3)};
+    uint16_t below[2] = {unpack12a(data + 6), unpack12b(data + 6)};
+    for (unsigned i = 0; i < 2; ++i) {
+        if (center[i] < 256 || center[i] > 3839 || below[i] < 128 || above[i] < 128 || below[i] > center[i] || above[i] > 4095u - center[i]) return false;
+    }
+    memcpy(n64_center, center, sizeof(center));
+    memcpy(n64_below, below, sizeof(below));
+    memcpy(n64_above, above, sizeof(above));
+    return true;
+}
+
+static int16_t n64_axis(uint16_t value, unsigned axis) {
+    int32_t delta = (int32_t)value - n64_center[axis];
+    uint16_t range = delta < 0 ? n64_below[axis] : n64_above[axis];
+    return axis12_quantized(value, n64_center[axis], range);
+}
+
+static bool parse_n64_full(const uint8_t* p, uint16_t len) {
+    if (len < 13) return false;
+    bb_input_state_t s;
+    bb_input_clear(&s);
+    uint8_t r = p[3], m = p[4], l = p[5];
+    if (r & 0x08) s.buttons |= 1u << 0;
+    if (r & 0x04) s.buttons |= 1u << 1;
+    if (r & 0x02) s.buttons |= 1u << 2;
+    if (m & 0x01) s.buttons |= 1u << 3;
+    if (l & 0x40) s.buttons |= 1u << 4;
+    if (r & 0x40) s.buttons |= 1u << 5;
+    if (l & 0x80) s.buttons |= 1u << 6;
+    if (r & 0x80) s.buttons |= 1u << 7;
+    if (m & 0x02) s.buttons |= 1u << 9;
+    if (m & 0x08) s.buttons |= 1u << 10;
+    if (r & 0x01) s.buttons |= 1u << 11;
+    if (m & 0x10) s.buttons |= 1u << 12;
+    if (m & 0x20) s.buttons |= 1u << 13;
+    if (l & 0x02) s.dpad |= BB_DPAD_UP;
+    if (l & 0x01) s.dpad |= BB_DPAD_DOWN;
+    if (l & 0x08) s.dpad |= BB_DPAD_LEFT;
+    if (l & 0x04) s.dpad |= BB_DPAD_RIGHT;
+    s.x = n64_axis(unpack12a(p + 6), 0);
+    s.y = (int16_t)-n64_axis(unpack12b(p + 6), 1);
+    s.lt = (l & 0x80) ? 255 : 0;
+    s.rt = (m & 0x08) ? 255 : 0;
+    uint8_t battery = p[2] >> 4;
+    uint8_t level = battery & 0x0e;
+    bb_state_update_battery(true, level >= 8 ? 100 : level * 100u / 8u, (battery & 1) ? 2 : 1);
+    bb_state_update_button_capabilities(0x00003effu);
+    submit_state(&s);
+    return true;
 }
 
 static bool parse_switch_full(const uint8_t* p, uint16_t len) {
@@ -747,6 +804,10 @@ void bb_driver_reset(void) {
     memset(switch2_cal_sum, 0, sizeof(switch2_cal_sum));
     memset(switch2_cal_center, 0, sizeof(switch2_cal_center));
     switch2_cal_samples = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        n64_center[i] = 2048;
+        n64_below[i] = n64_above[i] = 2047;
+    }
     bb_state_update_battery(false, 0, 0);
     bb_state_set_rumble_supported(false);
 }
@@ -759,6 +820,10 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
     memset(switch2_cal_sum, 0, sizeof(switch2_cal_sum));
     memset(switch2_cal_center, 0, sizeof(switch2_cal_center));
     switch2_cal_samples = 0;
+    for (unsigned i = 0; i < 2; ++i) {
+        n64_center[i] = 2048;
+        n64_below[i] = n64_above[i] = 2047;
+    }
     bb_state_update_battery(false, 0, 0);
     bool rumble = identity.kind == BB_CONTROLLER_DUALSENSE || identity.kind == BB_CONTROLLER_DUALSENSE_EDGE || identity.kind == BB_CONTROLLER_DUALSHOCK4 || identity.kind == BB_CONTROLLER_DUALSHOCK3 || identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_WII_U_PRO || identity.kind == BB_CONTROLLER_8BITDO;
     bb_state_set_rumble_supported(rumble);
@@ -826,8 +891,12 @@ bool bb_driver_handle_hid_report(const uint8_t* report, uint16_t length) {
     if (identity.kind == BB_CONTROLLER_STADIA && id == 0x03) {
         if (parse_stadia_aux(report, length)) return true;
     }
+    if (identity.kind == BB_CONTROLLER_NSO_N64) {
+        if (id == 0x30) return parse_n64_full(report, length);
+        return id == 0x21 || id == 0x3f;
+    }
     if (identity.kind == BB_CONTROLLER_8BITDO && parse_8bitdo_enhanced(report, length)) return true;
-    if (identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_NSO_NES || identity.kind == BB_CONTROLLER_NSO_SNES || identity.kind == BB_CONTROLLER_NSO_N64 || identity.kind == BB_CONTROLLER_NSO_GENESIS || identity.kind == BB_CONTROLLER_8BITDO) {
+    if (identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_NSO_NES || identity.kind == BB_CONTROLLER_NSO_SNES || identity.kind == BB_CONTROLLER_NSO_GENESIS || identity.kind == BB_CONTROLLER_8BITDO) {
         if (id == 0x30) return parse_switch_full(report, length);
         if (id == 0x3f) return parse_switch_simple(report, length);
         if (id == 0x21) return true;

@@ -238,6 +238,18 @@ static bool send_switch_subcommand(uint8_t subcommand, uint8_t value) {
     return hid_host_send_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
+static bool send_n64_calibration_read(bool user) {
+    uint8_t payload[15] = {0};
+    payload[0] = (uint8_t)(switch_output_seq++ & 0x0fu);
+    payload[2] = payload[6] = 0x01;
+    payload[3] = payload[4] = payload[7] = payload[8] = 0x40;
+    payload[9] = 0x10;
+    payload[10] = user ? 0x10 : 0x3d;
+    payload[11] = user ? 0x80 : 0x60;
+    payload[14] = user ? 11 : 9;
+    return hid_host_send_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+}
+
 static void switch_setup_begin(void) {
     switch_setup_state = 1;
     switch_setup_retries = 0;
@@ -247,14 +259,22 @@ static void switch_setup_begin(void) {
 }
 
 static void service_switch_setup(uint32_t now) {
-    if (!classic_hid_cid || !classic_switch_protocol || switch_setup_state == 0 || switch_setup_state == 7) return;
+    if (!classic_hid_cid || !classic_switch_protocol || switch_setup_state == 0 || (switch_setup_state == 7 && current_identity.kind != BB_CONTROLLER_NSO_N64) || switch_setup_state == 11) return;
     if ((int32_t)(now - switch_setup_at) < 0) return;
     bool sent = false;
     if (switch_setup_state == 1) sent = send_switch_report_mode(0x30);
     else if (switch_setup_state == 3) sent = send_switch_subcommand(0x48, 0x01);
     else if (switch_setup_state == 5) sent = send_switch_subcommand(0x30, 0x01);
+    else if (switch_setup_state == 7) sent = send_n64_calibration_read(true);
+    else if (switch_setup_state == 9) sent = send_n64_calibration_read(false);
     else {
         if (switch_setup_retries >= 2) {
+            if (switch_setup_state == 8 || switch_setup_state == 10) {
+                switch_setup_state = switch_setup_state == 8 ? 9 : 11;
+                switch_setup_retries = 0;
+                switch_setup_at = now;
+                return;
+            }
             switch_setup_state = 0;
             classic_switch_setup_sent = false;
             bb_state_set_rumble_supported(false);
@@ -290,6 +310,22 @@ static void switch_setup_ack(const uint8_t* report, uint16_t len) {
         switch_setup_state = 7;
         classic_switch_setup_sent = true;
         switch_setup_retries = 0;
+        switch_setup_at = now;
+    } else if (subcommand == 0x10 && current_identity.kind == BB_CONTROLLER_NSO_N64 && len >= 20) {
+        bool user = switch_setup_state == 8;
+        bool factory = switch_setup_state == 10;
+        uint32_t address = (uint32_t)report[15] | ((uint32_t)report[16] << 8) | ((uint32_t)report[17] << 16) | ((uint32_t)report[18] << 24);
+        uint8_t count = report[19];
+        if (len < 20u + count) return;
+        bool valid = false;
+        if (user && address == 0x8010u && count == 11) {
+            valid = report[20] == 0xb2 && report[21] == 0xa1 && bb_driver_set_n64_calibration(report + 22, 9);
+        } else if (factory && address == 0x603du && count == 9) {
+            valid = bb_driver_set_n64_calibration(report + 20, 9);
+        } else return;
+        switch_setup_state = valid || factory ? 11 : 9;
+        switch_setup_retries = 0;
+        switch_setup_at = now;
     }
 }
 
@@ -367,6 +403,7 @@ static bool send_current_rumble(uint8_t strength) {
             return send_ds4_rumble(strength);
         case BB_CONTROLLER_DUALSHOCK3:
             return send_ds3_rumble(strength);
+        case BB_CONTROLLER_NSO_N64:
         case BB_CONTROLLER_SWITCH_PRO:
         case BB_CONTROLLER_JOYCON_LEFT:
         case BB_CONTROLLER_JOYCON_RIGHT:
@@ -659,6 +696,10 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     if (!bb_controller_activate_or_create(addr, vid, pid, current_identity.name, &controller_index)) return;
     current_controller_index = controller_index;
     bb_driver_set_identity(&current_identity);
+    if (current_identity.kind == BB_CONTROLLER_NSO_N64 && classic_hid_cid && !classic_switch_protocol) {
+        classic_switch_protocol = true;
+        switch_setup_begin();
+    }
     if (current_identity.kind == BB_CONTROLLER_DUALSHOCK3) { send_ds3_activation(); send_ds3_rumble(0); }
     if (current_identity.kind == BB_CONTROLLER_DUALSHOCK4) send_ds4_rumble(0);
     if (current_identity.kind == BB_CONTROLLER_WII_U_PRO) {
@@ -1010,7 +1051,7 @@ static void classic_hid_event(uint8_t* packet) {
             }
             if (len && report[0] == 0x21) switch_setup_ack(report, len);
             if (len && (report[0] == 0x30 || report[0] == 0x3f)) {
-                bool switch_kind = current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_8BITDO;
+                bool switch_kind = current_identity.kind == BB_CONTROLLER_NSO_N64 || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_8BITDO;
                 if (switch_kind) {
                     classic_switch_protocol = true;
                     if (switch_setup_state == 0 && !classic_switch_setup_sent) switch_setup_begin();
@@ -1245,7 +1286,7 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
     service_switch_setup(now);
     bb_runtime_state_t live_state;
     bb_state_get(&live_state);
-    bool nintendo_stream = current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_SWITCH2_PRO || current_identity.kind == BB_CONTROLLER_NSO_GAMECUBE;
+    bool nintendo_stream = current_identity.kind == BB_CONTROLLER_NSO_N64 || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_SWITCH2_PRO || current_identity.kind == BB_CONTROLLER_NSO_GAMECUBE;
     if (live_state.controller_connected && nintendo_stream && last_controller_report_at && (uint32_t)(now - last_controller_report_at) >= 3000u) {
         if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
         else if (classic_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(classic_handle);
