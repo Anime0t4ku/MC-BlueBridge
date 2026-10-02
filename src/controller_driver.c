@@ -295,6 +295,67 @@ static bool parse_n64_full(const uint8_t* p, uint16_t len) {
     return true;
 }
 
+static bool parse_nso_retro(const uint8_t* report, uint16_t length) {
+    if (!report || length < 12) return false;
+    bool full = report[0] == 0x30;
+    if (!full && report[0] != 0x3f) return false;
+    bb_input_state_t state;
+    bb_input_clear(&state);
+    uint32_t bits = full ? ((uint32_t)report[3] | ((uint32_t)report[4] << 8) | ((uint32_t)report[5] << 16)) : ((uint32_t)report[1] | ((uint32_t)report[2] << 8));
+    uint8_t sources[14];
+    memset(sources, 255, sizeof(sources));
+    if (identity.kind == BB_CONTROLLER_NSO_GENESIS) {
+        sources[0] = full ? 2 : 0;
+        sources[1] = full ? 6 : 5;
+        sources[2] = full ? 3 : 1;
+        sources[3] = full ? 1 : 6;
+        sources[4] = full ? 0 : 2;
+        sources[5] = full ? 22 : 4;
+        sources[8] = 7;
+        sources[9] = 9;
+        sources[12] = 12;
+        sources[13] = 13;
+    } else if (identity.kind == BB_CONTROLLER_NSO_SNES) {
+        sources[0] = full ? 2 : 0;
+        sources[1] = full ? 3 : 1;
+        sources[2] = full ? 0 : 2;
+        sources[3] = full ? 1 : 3;
+        sources[4] = full ? 22 : 4;
+        sources[5] = full ? 6 : 5;
+        sources[6] = full ? 23 : 6;
+        sources[7] = full ? 7 : 15;
+        sources[8] = 8;
+        sources[9] = 9;
+    } else if (identity.kind == BB_CONTROLLER_NSO_NES) {
+        sources[0] = full ? 2 : 1;
+        sources[1] = full ? 3 : 0;
+        sources[4] = full ? 22 : 4;
+        sources[5] = full ? 6 : 5;
+        sources[8] = 8;
+        sources[9] = 9;
+    } else {
+        return false;
+    }
+    for (uint8_t i = 0; i < sizeof(sources); ++i) {
+        if (sources[i] < 24 && (bits & (1u << sources[i]))) state.buttons |= 1u << i;
+    }
+    if (full) {
+        if (bits & (1u << 17)) state.dpad |= BB_DPAD_UP;
+        if (bits & (1u << 16)) state.dpad |= BB_DPAD_DOWN;
+        if (bits & (1u << 19)) state.dpad |= BB_DPAD_LEFT;
+        if (bits & (1u << 18)) state.dpad |= BB_DPAD_RIGHT;
+        uint8_t battery = report[2] >> 4;
+        uint8_t level = battery & 0x0e;
+        bb_state_update_battery(true, level >= 8 ? 100 : level * 100u / 8u, (battery & 1) ? 2 : 1);
+    } else {
+        uint8_t hat = report[3] & 0x0f;
+        if (hat <= 7) state.dpad = hat_to_dpad(hat);
+    }
+    bb_state_update_button_capabilities(bb_controller_capabilities(identity.kind, identity.name).buttons);
+    submit_state(&state);
+    return true;
+}
+
 static bool parse_switch_full(const uint8_t* p, uint16_t len) {
     if (len < 12) return false;
     bb_input_state_t s;
@@ -896,7 +957,11 @@ bool bb_driver_handle_hid_report(const uint8_t* report, uint16_t length) {
         return id == 0x21 || id == 0x3f;
     }
     if (identity.kind == BB_CONTROLLER_8BITDO && parse_8bitdo_enhanced(report, length)) return true;
-    if (identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_NSO_NES || identity.kind == BB_CONTROLLER_NSO_SNES || identity.kind == BB_CONTROLLER_NSO_GENESIS || identity.kind == BB_CONTROLLER_8BITDO) {
+    if (identity.kind == BB_CONTROLLER_NSO_NES || identity.kind == BB_CONTROLLER_NSO_SNES || identity.kind == BB_CONTROLLER_NSO_GENESIS) {
+        if (id == 0x21) return true;
+        return parse_nso_retro(report, length);
+    }
+    if (identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_8BITDO) {
         if (id == 0x30) return parse_switch_full(report, length);
         if (id == 0x3f) return parse_switch_simple(report, length);
         if (id == 0x21) return true;
@@ -1006,6 +1071,10 @@ bool bb_driver_handle_nintendo_ble_report(const uint8_t* report, uint16_t length
     } else {
         s.lt = (b & 0x20) ? 255 : 0;
         s.rt = (a & 0x20) ? 255 : 0;
+    }
+    if (gamecube) {
+        s.buttons &= 0x000072ffu;
+        bb_state_update_button_capabilities(0x000072ffu);
     }
     submit_state(&s);
     return true;

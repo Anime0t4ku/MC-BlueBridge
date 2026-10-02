@@ -108,8 +108,10 @@ void bb_input_submit(const bb_input_state_t* state) {
     report.ry = axis_to_i8(ry);
     uint16_t lt = apply_trigger_deadzone(state->lt, profile.trigger_deadzone);
     uint16_t rt = apply_trigger_deadzone(state->rt, profile.trigger_deadzone);
-    report.lt = (uint8_t)lt;
-    report.rt = (uint8_t)rt;
+    bb_controller_t controller;
+    bb_active_controller_get(&controller, NULL);
+    bb_controller_kind_t kind = bb_controller_identify(controller.native_vendor_id, controller.native_product_id, controller.name);
+    uint8_t right_trigger_input = kind == BB_CONTROLLER_NSO_N64 ? 10 : 7;
     report.hat = bb_hat_from_dpad(state->dpad);
     uint16_t mapped = 0;
     uint32_t pressed_edges = state->buttons & ~previous_inputs;
@@ -125,27 +127,46 @@ void bb_input_submit(const bb_input_state_t* state) {
     if (profile.turbo_enabled && profile.turbo_control_mode == 1 && profile.turbo_control_button < BB_BUTTON_COUNT && (pressed_edges & (1u << profile.turbo_control_button))) turbo_toggle = !turbo_toggle;
     if (profile.turbo_enabled && profile.turbo_control_mode == 2 && profile.turbo_control_button < BB_BUTTON_COUNT && (state->buttons & (1u << profile.turbo_control_button))) dedicated_hold = true;
     for (uint8_t i = 0; i < BB_BUTTON_COUNT; ++i) {
-        if (!(state->buttons & (1u << i))) continue;
+        bool pressed = (state->buttons & (1u << i)) != 0;
+        bool trigger_input = i == 6 || i == right_trigger_input;
+        uint16_t trigger_value = i == 6 ? lt : rt;
+        if (!pressed && !(trigger_input && trigger_value)) continue;
         if (shortcut_layer) continue;
         if (profile.turbo_enabled && profile.turbo_control_mode > 0 && i == profile.turbo_control_button) continue;
         uint8_t target = profile.button_map[i];
         if (target < BB_OUTPUT_BUTTON_COUNT) {
-            mapped |= (uint16_t)(1u << target);
-        } else if (target >= BB_MAP_MACRO1 && target <= BB_MAP_MACRO4) {
+            if (pressed) mapped |= (uint16_t)(1u << target);
+            uint16_t raw_trigger = i == 6 ? state->lt : state->rt;
+            uint8_t value = trigger_input && raw_trigger ? (uint8_t)trigger_value : 255;
+            if (target == 6 && value > report.lt) report.lt = value;
+            if (target == 7 && value > report.rt) report.rt = value;
+        } else if (pressed && target >= BB_MAP_MACRO1 && target <= BB_MAP_MACRO4) {
             uint8_t macro_index = (uint8_t)(target - BB_MAP_MACRO1);
-            if (profile.macros[macro_index].enabled && profile.macros[macro_index].name[0]) mapped |= profile.macros[macro_index].output_mask;
+            if (profile.macros[macro_index].enabled && profile.macros[macro_index].name[0]) {
+                uint16_t mask = profile.macros[macro_index].output_mask;
+                mapped |= mask;
+                if (mask & (1u << 6)) report.lt = 255;
+                if (mask & (1u << 7)) report.rt = 255;
+            }
         }
     }
     if (profile.turbo_enabled && profile.turbo_rate_hz) {
         uint16_t active_turbo = 0;
         if (profile.turbo_control_mode == 0) active_turbo = runtime_turbo_mask;
         else if (turbo_toggle || dedicated_hold) active_turbo = profile.turbo_mask;
-        active_turbo &= mapped;
+        uint16_t active_outputs = mapped;
+        if (report.lt) active_outputs |= 1u << 6;
+        if (report.rt) active_outputs |= 1u << 7;
+        active_turbo &= active_outputs;
         if (active_turbo) {
             uint32_t period_ms = 1000u / profile.turbo_rate_hz;
             if (period_ms < 2) period_ms = 2;
             uint32_t phase = to_ms_since_boot(get_absolute_time()) % period_ms;
-            if (phase >= period_ms / 2u) mapped &= (uint16_t)~active_turbo;
+            if (phase >= period_ms / 2u) {
+                mapped &= (uint16_t)~active_turbo;
+                if (active_turbo & (1u << 6)) report.lt = 0;
+                if (active_turbo & (1u << 7)) report.rt = 0;
+            }
         }
     }
     previous_inputs = state->buttons;
@@ -196,6 +217,8 @@ bb_controller_kind_t bb_controller_identify(uint16_t vid, uint16_t pid, const ch
     if (contains_ci(name, "xbox") && contains_ci(name, "elite")) return BB_CONTROLLER_XBOX_ELITE;
     if (contains_ci(name, "switch 2 pro") || contains_ci(name, "pro controller 2")) return BB_CONTROLLER_SWITCH2_PRO;
     if (contains_ci(name, "gamecube") && contains_ci(name, "nintendo")) return BB_CONTROLLER_NSO_GAMECUBE;
+    if (contains_ci(name, "MD/Gen Control Pad")) return BB_CONTROLLER_NSO_GENESIS;
+    if (contains_ci(name, "HVC Controller")) return BB_CONTROLLER_NSO_NES;
     if (contains_ci(name, "n64") || contains_ci(name, "nintendo 64")) return BB_CONTROLLER_NSO_N64;
     if (contains_ci(name, "snes") || contains_ci(name, "super famicom")) return BB_CONTROLLER_NSO_SNES;
     if (contains_ci(name, "genesis") || contains_ci(name, "mega drive")) return BB_CONTROLLER_NSO_GENESIS;
@@ -219,6 +242,7 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     static const char* ds3[BB_BUTTON_COUNT] = {"Cross","Circle","Square","Triangle","L1","R1","L2","R2","Select","Start","L3","R3","PS","Extra 1","Extra 2","Extra 3","L4","R4","L5","R5","P1","P2","P3","P4","Aux 1","Aux 2"};
     static const char* xbox[BB_BUTTON_COUNT] = {"A","B","X","Y","LB","RB","LT","RT","View","Menu","LS","RS","Xbox","Share","Extra 1","Extra 2","P1","P3","P2","P4","Aux 1","Aux 2","Aux 3","Aux 4","Aux 5","Aux 6"};
     static const char* nintendo[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Minus","Plus","L Stick","R Stick","Home","Capture","GL","GR","L4","R4","L5","R5","P1","P2","P3","P4","Aux 1","Aux 2"};
+    static const char* gamecube[BB_BUTTON_COUNT] = {"B","A","Y","X","ZL","ZR","L","R","Unused","Start","Unused","Unused","Home","Capture","C","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused","Unused"};
     static const char* switch2[BB_BUTTON_COUNT] = {"B","A","Y","X","L","R","ZL","ZR","Minus","Plus","L Stick","R Stick","Home","Capture","GL","GR","C","L4","R4","L5","P1","P2","P3","P4","Aux 1","Aux 2"};
     static const char* stadia[BB_BUTTON_COUNT] = {"A","B","X","Y","L1","R1","L2","R2","Options","Menu","L3","R3","Stadia","Capture","Assistant","Extra","L4","R4","L5","R5","P1","P2","P3","P4","Aux 1","Aux 2"};
     static const char* n64[BB_BUTTON_COUNT] = {"A","B","C Left","C Right","L","R","Z","C Down","Unused","Start","ZR","C Up","Home","Capture","L4","R4","L5","R5","P1","P2","P3","P4","A3","A4","Aux 1","Aux 2"};
@@ -234,6 +258,7 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     else if (kind == BB_CONTROLLER_XBOX_ONE || kind == BB_CONTROLLER_XBOX_SERIES || kind == BB_CONTROLLER_XBOX_ADAPTIVE || kind == BB_CONTROLLER_XBOX_ELITE) labels = xbox;
     else if (kind == BB_CONTROLLER_STADIA) labels = stadia;
     else if (kind == BB_CONTROLLER_NSO_N64) labels = n64;
+    else if (kind == BB_CONTROLLER_NSO_GAMECUBE) labels = gamecube;
     else if (kind == BB_CONTROLLER_NSO_SNES) labels = snes;
     else if (kind == BB_CONTROLLER_NSO_NES) labels = nes;
     else if (kind == BB_CONTROLLER_NSO_GENESIS) labels = genesis;
@@ -298,14 +323,14 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
             c.right_trigger = 0;
             break;
         case BB_CONTROLLER_NSO_GENESIS:
-            c.buttons = 0x0000033fu;
+            c.buttons = 0x0000333fu;
             c.left_stick = 0;
             c.right_stick = 0;
             c.left_trigger = 0;
             c.right_trigger = 0;
             break;
         case BB_CONTROLLER_NSO_GAMECUBE:
-            c.buttons = 0x00005ff3u;
+            c.buttons = 0x000072ffu;
             break;
         case BB_CONTROLLER_8BITDO:
             c.buttons = 0x00003fffu;

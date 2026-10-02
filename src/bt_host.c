@@ -305,7 +305,8 @@ static void switch_setup_ack(const uint8_t* report, uint16_t len) {
         switch_setup_state = 5;
         switch_setup_retries = 0;
         switch_setup_at = now;
-        bb_state_set_rumble_supported(true);
+        bool has_rumble = current_identity.kind != BB_CONTROLLER_NSO_NES && current_identity.kind != BB_CONTROLLER_NSO_SNES && current_identity.kind != BB_CONTROLLER_NSO_GENESIS;
+        bb_state_set_rumble_supported(has_rumble);
     } else if (switch_setup_state == 6 && subcommand == 0x30) {
         switch_setup_state = 7;
         classic_switch_setup_sent = true;
@@ -525,7 +526,7 @@ static bool likely_controller_name(const char* name) {
     static const char* words[] = {
         "controller", "gamepad", "joy-con", "8bitdo", "pro 3", "xbox", "dualsense", "wireless controller",
         "stadia", "steam", "nimbus", "ouya", "wiimote", "wii remote", "atari", "icade", "famicom",
-        "nintendo", "genesis", "mega drive", "snes", "n64"
+        "nintendo", "genesis", "mega drive", "snes", "n64", "md/gen control pad"
     };
     for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); ++i) if (name_has(name, words[i])) return true;
     return false;
@@ -1051,7 +1052,7 @@ static void classic_hid_event(uint8_t* packet) {
             }
             if (len && report[0] == 0x21) switch_setup_ack(report, len);
             if (len && (report[0] == 0x30 || report[0] == 0x3f)) {
-                bool switch_kind = current_identity.kind == BB_CONTROLLER_NSO_N64 || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_8BITDO;
+                bool switch_kind = current_identity.kind == BB_CONTROLLER_NSO_NES || current_identity.kind == BB_CONTROLLER_NSO_SNES || current_identity.kind == BB_CONTROLLER_NSO_GENESIS || current_identity.kind == BB_CONTROLLER_NSO_N64 || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_8BITDO;
                 if (switch_kind) {
                     classic_switch_protocol = true;
                     if (switch_setup_state == 0 && !classic_switch_setup_sent) switch_setup_begin();
