@@ -931,6 +931,47 @@ bool bb_driver_refine_identity_from_hid_descriptor(const uint8_t* descriptor, ui
     return false;
 }
 
+bool bb_driver_handle_xbox_ble_report(const uint8_t* report, uint16_t length) {
+    if (identity.kind != BB_CONTROLLER_XBOX_SERIES && identity.kind != BB_CONTROLLER_XBOX_ONE) return false;
+    if (!report || length != 17 || report[0] != 1) return false;
+    bb_input_state_t state;
+    bb_input_clear(&state);
+    int16_t* axes[4] = {&state.x, &state.y, &state.rx, &state.ry};
+    for (uint8_t i = 0; i < 4; ++i) {
+        uint16_t value = little_endian_read_16(report, 1 + i * 2);
+        int32_t delta = (int32_t)value - 32768;
+        int32_t magnitude = delta < 0 ? -delta : delta;
+        const int32_t neutral = 512;
+        if (magnitude <= neutral) {
+            *axes[i] = 0;
+        } else {
+            int32_t limit = delta < 0 ? 32768 : 32767;
+            int32_t scaled = (magnitude - neutral) * limit / (limit - neutral);
+            *axes[i] = (int16_t)(delta < 0 ? -scaled : scaled);
+        }
+    }
+    state.lt = generic_trigger(little_endian_read_16(report, 9), 0, 1023);
+    state.rt = generic_trigger(little_endian_read_16(report, 11), 0, 1023);
+    uint8_t hat = report[13];
+    if (hat >= 1 && hat <= 8) state.dpad = hat_to_dpad(hat - 1);
+    uint16_t buttons = little_endian_read_16(report, 14);
+    const uint8_t source[11] = {0, 1, 3, 4, 6, 7, 10, 11, 13, 14, 12};
+    const uint8_t target[11] = {0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12};
+    for (uint8_t i = 0; i < 11; ++i) {
+        if (buttons & (1u << source[i])) state.buttons |= 1u << target[i];
+    }
+    if (state.lt > 10) state.buttons |= 1u << 6;
+    if (state.rt > 10) state.buttons |= 1u << 7;
+    uint32_t capabilities = 0x1fff;
+    if (identity.kind == BB_CONTROLLER_XBOX_SERIES) {
+        capabilities |= 1u << 13;
+        if (report[16] & 1) state.buttons |= 1u << 13;
+    }
+    bb_state_update_button_capabilities(capabilities);
+    submit_state(&state);
+    return true;
+}
+
 bool bb_driver_handle_hid_report(const uint8_t* report, uint16_t length) {
     if (!report || !length) return false;
     uint8_t id = report[0];

@@ -5,6 +5,7 @@
 #include "usb_device.h"
 #include "btstack.h"
 #include "ble/gatt-service/hids_host.h"
+#include "ble/gatt-service/device_information_service_client.h"
 #include "ble/le_device_db.h"
 #include "ble/le_device_db_tlv.h"
 #include "classic/btstack_link_key_db_tlv.h"
@@ -71,6 +72,9 @@ static volatile bool rumble_request_pending;
 static volatile uint8_t rumble_request_strength;
 static volatile uint16_t rumble_request_duration_ms;
 static bool rumble_active;
+static uint8_t xbox_rumble_payload[8];
+static bool xbox_rumble_write_pending;
+static bool xbox_rumble_retry;
 static uint8_t dualsense_output_seq;
 static uint8_t switch_output_seq;
 static bool classic_switch_setup_sent;
@@ -395,8 +399,38 @@ static bool send_wiiu_rumble(uint8_t strength) {
     return hid_host_send_report(classic_hid_cid, 0x10, &payload, 1) == ERROR_CODE_SUCCESS;
 }
 
+static bool xbox_ble_connected(void) {
+    return le_handle != HCI_CON_HANDLE_INVALID && hids_cid && (current_identity.kind == BB_CONTROLLER_XBOX_SERIES || current_identity.kind == BB_CONTROLLER_XBOX_ONE);
+}
+
+static bool send_xbox_ble_rumble(uint8_t strength) {
+    xbox_rumble_retry = false;
+    if (!xbox_ble_connected()) return false;
+    if (xbox_rumble_write_pending) {
+        xbox_rumble_retry = true;
+        return false;
+    }
+    memset(xbox_rumble_payload, 0, sizeof(xbox_rumble_payload));
+    xbox_rumble_payload[0] = 3;
+    uint8_t magnitude = (uint8_t)(((uint16_t)strength * 100u) / 255u);
+    xbox_rumble_payload[3] = magnitude;
+    xbox_rumble_payload[4] = magnitude;
+    xbox_rumble_payload[5] = strength ? 255 : 0;
+    uint8_t status = hids_host_send_write_report(hids_cid, 3, HID_REPORT_TYPE_OUTPUT, xbox_rumble_payload, sizeof(xbox_rumble_payload));
+    if (status == ERROR_CODE_SUCCESS) {
+        xbox_rumble_write_pending = true;
+        return true;
+    }
+    xbox_rumble_retry = status == ERROR_CODE_COMMAND_DISALLOWED || status == GATT_CLIENT_IN_WRONG_STATE;
+    if (status == ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE) bb_state_set_rumble_supported(false);
+    return false;
+}
+
 static bool send_current_rumble(uint8_t strength) {
     switch (current_identity.kind) {
+        case BB_CONTROLLER_XBOX_SERIES:
+        case BB_CONTROLLER_XBOX_ONE:
+            return send_xbox_ble_rumble(strength);
         case BB_CONTROLLER_DUALSENSE:
         case BB_CONTROLLER_DUALSENSE_EDGE:
             return send_dualsense_rumble(strength);
@@ -431,6 +465,8 @@ static void service_rumble(void) {
             rumble_active_strength = strength;
             rumble_stop_at = now + duration;
             rumble_refresh_at = now + 80u;
+        } else if (xbox_ble_connected() && xbox_rumble_retry) {
+            rumble_request_pending = true;
         }
     }
     if (rumble_active && (int32_t)(now - rumble_stop_at) < 0 && (int32_t)(now - rumble_refresh_at) >= 0) {
@@ -439,7 +475,8 @@ static void service_rumble(void) {
         rumble_refresh_at = now + 80u;
     }
     if (rumble_active && (int32_t)(now - rumble_stop_at) >= 0) {
-        send_current_rumble(0);
+        bool stopped = send_current_rumble(0);
+        if (!stopped && xbox_ble_connected() && xbox_rumble_retry) return;
         rumble_active = false;
         rumble_active_strength = 0;
         rumble_refresh_at = 0;
@@ -747,6 +784,8 @@ static void controller_disconnected(void) {
     classic_hid_cid = 0;
     classic_handle = HCI_CON_HANDLE_INVALID;
     hids_cid = 0;
+    xbox_rumble_write_pending = false;
+    xbox_rumble_retry = false;
     dualsense_output_seq = 0;
     switch_output_seq = 0;
     classic_switch_setup_sent = false;
@@ -866,7 +905,7 @@ static void enable_nintendo_notifications(void) {
 static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     (void)channel;
     (void)size;
-    if (packet_type != HCI_EVENT_PACKET || hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META) return;
+    if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META) return;
     switch (hci_event_gattservice_meta_get_subevent_code(packet)) {
         case GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED:
             if (gattservice_subevent_hid_service_connected_get_status(packet) != ERROR_CODE_SUCCESS) {
@@ -874,16 +913,45 @@ static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet,
                 return;
             }
             activate_controller(pending_addr, pending_addr_type, pending_vid, pending_pid, pending_name);
+            xbox_rumble_write_pending = false;
+            xbox_rumble_retry = false;
+            if (xbox_ble_connected()) bb_state_set_rumble_supported(true);
             break;
         case GATTSERVICE_SUBEVENT_HID_REPORT: {
             uint8_t service = gattservice_subevent_hid_report_get_service_index(packet);
             bb_driver_set_hid_descriptor(hids_host_descriptor_storage_get_descriptor_data(hids_cid, service), hids_host_descriptor_storage_get_descriptor_len(hids_cid, service));
             last_controller_report_at = btstack_run_loop_get_time_ms();
-            bb_driver_handle_hid_report(gattservice_subevent_hid_report_get_report(packet), gattservice_subevent_hid_report_get_report_len(packet));
+            const uint8_t* report = gattservice_subevent_hid_report_get_report(packet);
+            uint16_t length = gattservice_subevent_hid_report_get_report_len(packet);
+            if (!bb_driver_handle_xbox_ble_report(report, length)) bb_driver_handle_hid_report(report, length);
             break;
         }
+        case GATTSERVICE_SUBEVENT_HID_REPORT_WRITTEN:
+            if (gattservice_subevent_hid_report_written_get_hids_cid(packet) == hids_cid && gattservice_subevent_hid_report_written_get_report_id(packet) == 3) xbox_rumble_write_pending = false;
+            break;
         case GATTSERVICE_SUBEVENT_HID_SERVICE_DISCONNECTED:
             controller_disconnected();
+            break;
+        default:
+            break;
+    }
+}
+
+static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
+    (void)channel;
+    if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || size < 6 || hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META) return;
+    switch (hci_event_gattservice_meta_get_subevent_code(packet)) {
+        case GATTSERVICE_SUBEVENT_DEVICE_INFORMATION_PNP_ID:
+            if (size < 13 || gattservice_subevent_device_information_pnp_id_get_con_handle(packet) != le_handle || gattservice_subevent_device_information_pnp_id_get_att_status(packet) != ERROR_CODE_SUCCESS) return;
+            if (gattservice_subevent_device_information_pnp_id_get_vendor_source_id(packet) == 2) {
+                pending_vid = gattservice_subevent_device_information_pnp_id_get_vendor_id(packet);
+                pending_pid = gattservice_subevent_device_information_pnp_id_get_product_id(packet);
+            }
+            break;
+        case GATTSERVICE_SUBEVENT_DEVICE_INFORMATION_DONE:
+            if (gattservice_subevent_device_information_done_get_con_handle(packet) == le_handle && le_handle != HCI_CON_HANDLE_INVALID) {
+                if (hids_host_connect(le_handle, hids_handler, HID_PROTOCOL_MODE_REPORT, &hids_cid) != ERROR_CODE_SUCCESS) gap_disconnect(le_handle);
+            }
             break;
         default:
             break;
@@ -915,7 +983,9 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
     if (le_custom_nintendo) {
         enable_nintendo_notifications();
     } else {
-        hids_host_connect(le_handle, hids_handler, HID_PROTOCOL_MODE_REPORT, &hids_cid);
+        if (device_information_service_client_query(le_handle, ble_identity_handler) != ERROR_CODE_SUCCESS) {
+            if (hids_host_connect(le_handle, hids_handler, HID_PROTOCOL_MODE_REPORT, &hids_cid) != ERROR_CODE_SUCCESS) gap_disconnect(le_handle);
+        }
     }
 }
 
@@ -1336,6 +1406,7 @@ void bb_bt_host_init(void) {
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
     gatt_client_init();
+    device_information_service_client_init();
     hids_host_init(hids_descriptor_storage, sizeof(hids_descriptor_storage));
     hid_host_init(classic_hid_storage, sizeof(classic_hid_storage));
     hid_host_register_packet_handler(hci_handler);
@@ -1450,7 +1521,7 @@ bool bb_bt_host_disconnect_current(void) {
 }
 
 bool bb_bt_host_rumble_test(uint8_t strength, uint16_t duration_ms) {
-    if (!classic_hid_cid) return false;
+    if (!classic_hid_cid && !xbox_ble_connected()) return false;
     bb_runtime_state_t state;
     bb_state_get(&state);
     if (!state.rumble_supported) return false;
