@@ -3,10 +3,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLUEBRIDGE_VERSION "1.0.0-beta-16"
-#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=9"
+#define BLUEBRIDGE_VERSION "1.0.0-beta-17"
+#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=10"
 #define BLUEBRIDGE_PROTOCOL_VERSION 2
-#define BB_CONFIG_SCHEMA 9
+#define BB_CONFIG_SCHEMA 10
 #define BB_MAX_NAME 32
 #define BB_MAX_PROFILE_NAME 24
 #define BB_MAX_CONTROLLERS 8
@@ -92,7 +92,13 @@ typedef struct __attribute__((packed)) {
     uint32_t next_profile_id;
     uint16_t next_mister_identity;
     bb_controller_t controllers[BB_MAX_CONTROLLERS];
+    char controller_names[BB_MAX_CONTROLLERS][BB_MAX_NAME];
 } bb_config_t;
+
+#define BB_CONFIG_LEGACY_SIZE offsetof(bb_config_t, controller_names)
+bool bb_controller_rename(uint8_t index, const char* name);
+bool bb_capture_is_tester(void);
+void bb_controller_name_get(uint8_t index, char* out, size_t size);
 
 typedef enum {
     BB_CAPTURE_NONE = 0,

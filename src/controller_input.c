@@ -74,7 +74,8 @@ void bb_input_submit(const bb_input_state_t* state) {
     static uint8_t last_turbo_button;
     static uint8_t last_turbo_modifier;
     bb_state_update_live_input(state->x, state->y, state->rx, state->ry, state->lt, state->rt, state->dpad, state->buttons);
-    if (bb_capture_process(state->buttons)) {
+    bool suppress_output = bb_capture_process(state->buttons);
+    if (suppress_output && !bb_capture_is_tester()) {
         previous_inputs = state->buttons;
         bb_gamepad_report_t neutral = {0};
         bb_state_update_gamepad(&neutral);
@@ -172,7 +173,12 @@ void bb_input_submit(const bb_input_state_t* state) {
     previous_inputs = state->buttons;
     report.buttons = mapped;
     bb_state_update_gamepad(&report);
-    bb_usb_submit(&report);
+    if (suppress_output) {
+        bb_gamepad_report_t neutral = {0};
+        bb_usb_submit(&neutral);
+    } else {
+        bb_usb_submit(&report);
+    }
 }
 
 bb_controller_kind_t bb_controller_identify(uint16_t vid, uint16_t pid, const char* name) {

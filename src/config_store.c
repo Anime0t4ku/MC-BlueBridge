@@ -155,6 +155,14 @@ bool bb_config_load(bb_config_t* cfg) {
         *cfg = *stored;
         return true;
     }
+    if (header->size == BB_CONFIG_LEGACY_SIZE) {
+        uint32_t schema;
+        memcpy(&schema, payload, sizeof(schema));
+        if ((schema != 8 && schema != 9) || header->checksum != checksum_bytes(payload, header->size)) return false;
+        memset(cfg, 0, sizeof(*cfg));
+        memcpy(cfg, payload, header->size);
+        return true;
+    }
     if (header->size == sizeof(legacy_config_v7_t)) {
         const legacy_config_v7_t* stored = (const legacy_config_v7_t*)payload;
         if (stored->schema != 7 || header->checksum != checksum_bytes(stored, sizeof(*stored))) return false;

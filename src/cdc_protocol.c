@@ -20,6 +20,8 @@ static size_t used;
 static bb_config_t import_cfg;
 static uint8_t* import_bytes = (uint8_t*)&import_cfg;
 static size_t import_received;
+static size_t import_size;
+static uint32_t import_schema;
 static uint32_t import_checksum;
 static bool import_active;
 static bb_config_t export_cfg;
@@ -60,6 +62,7 @@ static void send_status(const char* id) {
     bb_runtime_state_t state;
     bb_profile_t profile;
     bb_state_get(&state);
+    if (state.controller_connected && state.controller_index >= 0) bb_controller_name_get((uint8_t)state.controller_index, state.controller_name, sizeof(state.controller_name));
     bb_active_profile_get(&profile);
     uint8_t active_profile = bb_active_profile_index();
     uint8_t output_mode = bb_output_mode_value();
@@ -82,13 +85,15 @@ static void send_controllers(const char* id) {
     bb_runtime_state_t runtime;
     bb_config_get(&cfg);
     bb_state_get(&runtime);
-    char out[2048];
+    char out[4096];
     size_t pos = 0;
     pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "{\"active\":%u,\"connected_index\":%d,\"controllers\":[", bb_selected_controller_index(), runtime.controller_connected ? runtime.controller_index : -1);
-    for (uint8_t i = 0; i < cfg.controller_count && pos + 220 < sizeof(out); ++i) {
+    for (uint8_t i = 0; i < cfg.controller_count && pos + 420 < sizeof(out); ++i) {
         const bb_controller_t* c = &cfg.controllers[i];
+        char display[BB_MAX_NAME];
+        bb_controller_name_get(i, display, sizeof(display));
         bb_controller_kind_t kind = bb_controller_identify(c->native_vendor_id, c->native_product_id, c->name);
-        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s}", i ? "," : "", i, (unsigned long)c->id, c->name, (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, runtime.controller_connected && runtime.controller_index == i ? "true" : "false");
+        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"name\":\"%s\",\"model_name\":\"%s\",\"custom_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s}", i ? "," : "", i, (unsigned long)c->id, display, c->name, cfg.controller_names[i], (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, runtime.controller_connected && runtime.controller_index == i ? "true" : "false");
     }
     snprintf(out + pos, sizeof(out) - pos, "]}");
     send_ok(id, out);
@@ -103,11 +108,13 @@ static void send_profiles(const char* id) {
         send_err(id, "no_controller_profile_store");
         return;
     }
+    char display[BB_MAX_NAME];
+    bb_controller_name_get(controller_index, display, sizeof(display));
     bb_controller_kind_t kind = bb_controller_identify(controller->native_vendor_id, controller->native_product_id, controller->name);
     bb_controller_capabilities_t caps = bb_controller_capabilities(kind, controller->name);
     char out[2048];
     size_t pos = 0;
-    pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "{\"controller_index\":%u,\"controller_id\":%lu,\"controller_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"active\":%u,\"capabilities\":{\"buttons\":%lu,\"dpad\":%s,\"left_stick\":%s,\"right_stick\":%s,\"left_trigger\":%s,\"right_trigger\":%s},\"labels\":[", controller_index, (unsigned long)controller->id, controller->name, (unsigned)kind, bb_controller_kind_name(kind), controller->native_vendor_id, controller->native_product_id, controller->active_profile, (unsigned long)caps.buttons, caps.dpad ? "true" : "false", caps.left_stick ? "true" : "false", caps.right_stick ? "true" : "false", caps.left_trigger ? "true" : "false", caps.right_trigger ? "true" : "false");
+    pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "{\"controller_index\":%u,\"controller_id\":%lu,\"controller_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"active\":%u,\"capabilities\":{\"buttons\":%lu,\"dpad\":%s,\"left_stick\":%s,\"right_stick\":%s,\"left_trigger\":%s,\"right_trigger\":%s},\"labels\":[", controller_index, (unsigned long)controller->id, display, (unsigned)kind, bb_controller_kind_name(kind), controller->native_vendor_id, controller->native_product_id, controller->active_profile, (unsigned long)caps.buttons, caps.dpad ? "true" : "false", caps.left_stick ? "true" : "false", caps.right_stick ? "true" : "false", caps.left_trigger ? "true" : "false", caps.right_trigger ? "true" : "false");
     for (uint8_t i = 0; i < BB_BUTTON_COUNT; ++i) pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s\"%s\"", i ? "," : "", bb_controller_button_label(kind, controller->name, i));
     pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "],\"profiles\":[");
     for (uint8_t i = 0; i < controller->profile_count && pos + 150 < sizeof(out); ++i) {
@@ -203,8 +210,8 @@ static void handle_command(char* text) {
     if (!proto || strcmp(proto, "BB1") || !id || !cmd) return;
 
     if (!strcmp(cmd, "HELLO")) {
-        char out[192];
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"firmware_id\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST);
+        char out[512];
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true},\"firmware_id\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST);
         send_ok(id, out);
         return;
     }
@@ -266,8 +273,8 @@ static void handle_command(char* text) {
     if (!strcmp(cmd, "CAPTURE_STATUS")) {
         bb_runtime_state_t state;
         bb_state_get(&state);
-        char out[512];
-        snprintf(out, sizeof(out), "{\"mode\":%u,\"ready\":%s,\"button\":%u,\"buttons\":%lu,\"dpad\":%u,\"x\":%d,\"y\":%d,\"rx\":%d,\"ry\":%d,\"lt\":%u,\"rt\":%u,\"battery_supported\":%s,\"battery_percent\":%u,\"battery_state\":%u,\"rumble_supported\":%s}", state.capture_mode, state.capture_ready ? "true" : "false", state.captured_button, (unsigned long)state.raw_buttons, state.raw_dpad, state.raw_x, state.raw_y, state.raw_rx, state.raw_ry, state.raw_lt, state.raw_rt, state.battery_supported ? "true" : "false", state.battery_percent, state.battery_state, state.rumble_supported ? "true" : "false");
+        char out[768];
+        snprintf(out, sizeof(out), "{\"mode\":%u,\"ready\":%s,\"button\":%u,\"buttons\":%lu,\"dpad\":%u,\"x\":%d,\"y\":%d,\"rx\":%d,\"ry\":%d,\"lt\":%u,\"rt\":%u,\"battery_supported\":%s,\"battery_percent\":%u,\"battery_state\":%u,\"rumble_supported\":%s,\"output\":{\"buttons\":%u,\"hat\":%u,\"x\":%d,\"y\":%d,\"rx\":%d,\"ry\":%d,\"lt\":%u,\"rt\":%u}}", state.capture_mode, state.capture_ready ? "true" : "false", state.captured_button, (unsigned long)state.raw_buttons, state.raw_dpad, state.raw_x, state.raw_y, state.raw_rx, state.raw_ry, state.raw_lt, state.raw_rt, state.battery_supported ? "true" : "false", state.battery_percent, state.battery_state, state.rumble_supported ? "true" : "false", state.report.buttons, state.report.hat, state.report.x, state.report.y, state.report.rx, state.report.ry, state.report.lt, state.report.rt);
         send_ok(id, out);
         return;
     }
@@ -329,6 +336,12 @@ static void handle_command(char* text) {
     if (!strcmp(cmd, "PROFILE_DELETE")) {
         char* a = next_field(&cursor);
         if (!a || !bb_profile_delete((uint8_t)atoi(a))) send_err(id, "profile"); else send_ok(id, "deleted");
+        return;
+    }
+    if (!strcmp(cmd, "CONTROLLER_RENAME")) {
+        char* index = next_field(&cursor);
+        if (!index || !bb_controller_rename((uint8_t)atoi(index), cursor ? cursor : "")) send_err(id, "controller_name");
+        else send_ok(id, "renamed");
         return;
     }
     if (!strcmp(cmd, "PROFILE_RENAME")) {
@@ -443,13 +456,15 @@ static void handle_command(char* text) {
         char* size = next_field(&cursor);
         char* checksum = next_field(&cursor);
         int schema_value = schema ? atoi(schema) : 0;
-        if (!schema || !size || !checksum || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8) || (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) {
+        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9))) {
             import_active = false;
             send_err(id, "config_header");
             return;
         }
         memset(&import_cfg, 0, sizeof(import_cfg));
         import_received = 0;
+        import_size = (size_t)strtoul(size, NULL, 10);
+        import_schema = (uint32_t)schema_value;
         import_checksum = (uint32_t)strtoul(checksum, NULL, 10);
         import_active = true;
         send_ok(id, "ready");
@@ -462,7 +477,7 @@ static void handle_command(char* text) {
         size_t offset = (size_t)strtoul(off, NULL, 10);
         uint8_t chunk[BB_IMPORT_CHUNK_MAX];
         size_t count = 0;
-        if (offset != import_received || !decode_hex(hex, chunk, sizeof(chunk), &count) || offset + count > sizeof(import_cfg)) {
+        if (offset != import_received || !decode_hex(hex, chunk, sizeof(chunk), &count) || offset + count > import_size) {
             import_active = false;
             send_err(id, "config_chunk");
             return;
@@ -473,7 +488,9 @@ static void handle_command(char* text) {
         return;
     }
     if (!strcmp(cmd, "CONFIG_IMPORT_COMMIT")) {
-        if (!import_active || import_received != sizeof(import_cfg) || !bb_config_import(&import_cfg, import_checksum)) {
+        uint32_t hash = 2166136261u;
+        for (size_t i = 0; i < import_received; ++i) { hash ^= import_bytes[i]; hash *= 16777619u; }
+        if (!import_active || import_received != import_size || hash != import_checksum || import_cfg.schema != import_schema || !bb_config_import(&import_cfg, bb_config_checksum(&import_cfg))) {
             import_active = false;
             send_err(id, "config_import");
             return;

@@ -76,7 +76,7 @@ void bb_state_init(void) {
     runtime_state.report.hat = 0;
     if (!bb_config_load(&config_state)) {
         init_defaults(&config_state);
-    } else if (config_state.schema == 8) {
+    } else if (config_state.schema == 8 || config_state.schema == 9) {
         config_state.schema = BB_CONFIG_SCHEMA;
         if (config_state.output_mode < BB_OUTPUT_MISTER || config_state.output_mode > BB_OUTPUT_SWITCH) config_state.output_mode = BB_OUTPUT_MISTER;
         config_save_pending = true;
@@ -206,6 +206,13 @@ void bb_capture_stop(void) {
     capture_previous_buttons = runtime_state.raw_buttons;
     capture_button_mask = 0;
     critical_section_exit(&lock);
+}
+
+bool bb_capture_is_tester(void) {
+    critical_section_enter_blocking(&lock);
+    bool tester = runtime_state.capture_mode == BB_CAPTURE_TESTER;
+    critical_section_exit(&lock);
+    return tester;
 }
 
 bool bb_capture_process(uint32_t buttons) {
@@ -599,12 +606,39 @@ bool bb_profile_share_mapping(uint8_t profile_index, uint8_t target_index) {
     return ok;
 }
 
+bool bb_controller_rename(uint8_t index, const char* name) {
+    if (!name || strlen(name) >= BB_MAX_NAME) return false;
+    critical_section_enter_blocking(&lock);
+    bool ok = index < config_state.controller_count;
+    if (ok) {
+        set_name(config_state.controller_names[index], BB_MAX_NAME, name, "");
+        config_save_pending = true;
+    }
+    critical_section_exit(&lock);
+    return ok;
+}
+
+void bb_controller_name_get(uint8_t index, char* out, size_t size) {
+    if (!out || !size) return;
+    out[0] = 0;
+    critical_section_enter_blocking(&lock);
+    if (index < config_state.controller_count) {
+        const char* custom = config_state.controller_names[index];
+        set_name(out, size, custom[0] ? custom : config_state.controllers[index].name, "Bluetooth Controller");
+    }
+    critical_section_exit(&lock);
+}
+
 bool bb_controller_forget(uint8_t index, uint8_t address_out[6]) {
     bool ok = false;
     critical_section_enter_blocking(&lock);
     if (index < config_state.controller_count) {
         if (address_out) memcpy(address_out, config_state.controllers[index].bluetooth_address, 6);
-        for (uint8_t i = index; i + 1 < config_state.controller_count; ++i) config_state.controllers[i] = config_state.controllers[i + 1];
+        for (uint8_t i = index; i + 1 < config_state.controller_count; ++i) {
+            config_state.controllers[i] = config_state.controllers[i + 1];
+            memcpy(config_state.controller_names[i], config_state.controller_names[i + 1], BB_MAX_NAME);
+        }
+        memset(config_state.controller_names[config_state.controller_count - 1], 0, BB_MAX_NAME);
         config_state.controller_count--;
         if (config_state.controller_count == 0) config_state.active_controller = 0;
         else if (config_state.active_controller > index) config_state.active_controller--;
@@ -666,6 +700,7 @@ bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_
         controller->native_vendor_id = vendor_id;
         controller->native_product_id = product_id;
         set_name(controller->name, sizeof(controller->name), name, "Bluetooth Controller");
+        memset(config_state.controller_names[index], 0, BB_MAX_NAME);
         controller->profile_count = 1;
         controller->active_profile = 0;
         uint16_t identity = allocate_mister_identity_locked();
@@ -746,7 +781,7 @@ const char* bb_output_mode_name(bb_output_mode_t mode) {
 }
 
 bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
-    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8) || bb_config_checksum(cfg) != checksum) return false;
+    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8 && cfg->schema != 9) || bb_config_checksum(cfg) != checksum) return false;
     if (cfg->controller_count > BB_MAX_CONTROLLERS) return false;
     if (cfg->controller_count && cfg->active_controller >= cfg->controller_count) return false;
     for (uint8_t i = 0; i < cfg->controller_count; ++i) {
@@ -755,6 +790,12 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
     }
     bb_config_t value = *cfg;
     value.schema = BB_CONFIG_SCHEMA;
+    for (uint8_t i = 0; i < BB_MAX_CONTROLLERS; ++i) {
+        value.controller_names[i][BB_MAX_NAME - 1] = 0;
+        char clean[BB_MAX_NAME] = {0};
+        set_name(clean, sizeof(clean), value.controller_names[i], "");
+        memcpy(value.controller_names[i], clean, sizeof(clean));
+    }
     if (value.output_mode < BB_OUTPUT_MISTER || value.output_mode > BB_OUTPUT_SWITCH) value.output_mode = BB_OUTPUT_MISTER;
     bb_config_set(&value, true);
     return true;
