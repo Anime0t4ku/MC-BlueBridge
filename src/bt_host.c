@@ -6,6 +6,7 @@
 #include "btstack.h"
 #include "ble/gatt-service/hids_host.h"
 #include "ble/gatt-service/device_information_service_client.h"
+#include "ble/gatt-service/battery_service_client.h"
 #include "ble/le_device_db.h"
 #include "ble/le_device_db_tlv.h"
 #include "classic/btstack_link_key_db_tlv.h"
@@ -45,6 +46,7 @@ static bd_addr_t connected_name_addr;
 static uint16_t classic_hid_cid;
 static hci_con_handle_t classic_handle = HCI_CON_HANDLE_INVALID;
 static uint16_t hids_cid;
+static uint16_t xbox_battery_cid;
 static hci_con_handle_t le_handle = HCI_CON_HANDLE_INVALID;
 static bool stack_ready;
 static bool scanning;
@@ -761,6 +763,9 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
 }
 
 static void controller_disconnected(void) {
+    uint16_t battery_cid = xbox_battery_cid;
+    xbox_battery_cid = 0;
+    if (battery_cid) battery_service_client_disconnect(battery_cid);
     classic_generation++;
     identity_query_pending = false;
     connected_name_request = false;
@@ -902,6 +907,29 @@ static void enable_nintendo_notifications(void) {
     gatt_client_write_client_characteristic_configuration(nintendo_gatt_handler, le_handle, &nintendo_characteristic, GATT_CLIENT_CHARACTERISTICS_CONFIGURATION_NOTIFICATION);
 }
 
+static void xbox_battery_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
+    (void)channel;
+    if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || size < 8 || hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META || !xbox_ble_connected() || !xbox_battery_cid) return;
+    switch (hci_event_gattservice_meta_get_subevent_code(packet)) {
+        case GATTSERVICE_SUBEVENT_BATTERY_SERVICE_CONNECTED:
+            if (gattservice_subevent_battery_service_connected_get_bas_cid(packet) != xbox_battery_cid) return;
+            if (gattservice_subevent_battery_service_connected_get_status(packet) != ERROR_CODE_SUCCESS) {
+                xbox_battery_cid = 0;
+                return;
+            }
+            if (gattservice_subevent_battery_service_connected_get_num_instances(packet)) battery_service_client_read_battery_level(xbox_battery_cid, 0);
+            break;
+        case GATTSERVICE_SUBEVENT_BATTERY_SERVICE_LEVEL: {
+            if (gattservice_subevent_battery_service_level_get_bas_cid(packet) != xbox_battery_cid || gattservice_subevent_battery_service_level_get_service_index(packet) != 0 || gattservice_subevent_battery_service_level_get_att_status(packet) != ATT_ERROR_SUCCESS) return;
+            uint8_t level = gattservice_subevent_battery_service_level_get_level(packet);
+            if (level <= 100) bb_state_update_battery(true, level, 0);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
 static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -915,7 +943,10 @@ static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet,
             activate_controller(pending_addr, pending_addr_type, pending_vid, pending_pid, pending_name);
             xbox_rumble_write_pending = false;
             xbox_rumble_retry = false;
-            if (xbox_ble_connected()) bb_state_set_rumble_supported(true);
+            if (xbox_ble_connected()) {
+                bb_state_set_rumble_supported(true);
+                if (!xbox_battery_cid && battery_service_client_connect(le_handle, xbox_battery_handler, 60000, &xbox_battery_cid) != ERROR_CODE_SUCCESS) xbox_battery_cid = 0;
+            }
             break;
         case GATTSERVICE_SUBEVENT_HID_REPORT: {
             uint8_t service = gattservice_subevent_hid_report_get_service_index(packet);
@@ -1407,6 +1438,7 @@ void bb_bt_host_init(void) {
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
     gatt_client_init();
     device_information_service_client_init();
+    battery_service_client_init();
     hids_host_init(hids_descriptor_storage, sizeof(hids_descriptor_storage));
     hid_host_init(classic_hid_storage, sizeof(classic_hid_storage));
     hid_host_register_packet_handler(hci_handler);

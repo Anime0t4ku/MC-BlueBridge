@@ -7,6 +7,7 @@
 #include "bt_host.h"
 #include "pico/bootrom.h"
 #include "pico/stdlib.h"
+#include "pico/unique_id.h"
 #include "tusb.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,8 @@
 
 static char line[BB_CDC_LINE_MAX];
 static size_t used;
+static bool adapter_rename_reenumeration_pending;
+static uint32_t adapter_rename_reenumeration_at;
 static bb_config_t import_cfg;
 static uint8_t* import_bytes = (uint8_t*)&import_cfg;
 static size_t import_received;
@@ -210,9 +213,24 @@ static void handle_command(char* text) {
     if (!proto || strcmp(proto, "BB1") || !id || !cmd) return;
 
     if (!strcmp(cmd, "HELLO")) {
-        char out[512];
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true},\"firmware_id\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST);
+        char out[768], adapter_name[BB_MAX_NAME], custom_name[BB_MAX_NAME];
+        char adapter_id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
+        bb_adapter_name_get(adapter_name, sizeof(adapter_name));
+        bb_adapter_custom_name_get(custom_name, sizeof(custom_name));
+        pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
         send_ok(id, out);
+        return;
+    }
+    if (!strcmp(cmd, "ADAPTER_RENAME")) {
+        char* name = next_field(&cursor);
+        if (!bb_adapter_rename(name ? name : "")) send_err(id, "adapter_name");
+        else {
+            send_ok(id, "renamed");
+            tud_cdc_write_flush();
+            adapter_rename_reenumeration_at = to_ms_since_boot(get_absolute_time()) + 150u;
+            adapter_rename_reenumeration_pending = true;
+        }
         return;
     }
     if (!strcmp(cmd, "STATUS")) {
@@ -456,7 +474,7 @@ static void handle_command(char* text) {
         char* size = next_field(&cursor);
         char* checksum = next_field(&cursor);
         int schema_value = schema ? atoi(schema) : 0;
-        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9))) {
+        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9 && schema_value != 10))) {
             import_active = false;
             send_err(id, "config_header");
             return;
@@ -518,6 +536,10 @@ static void handle_command(char* text) {
 }
 
 void bb_cdc_poll(void) {
+    if (adapter_rename_reenumeration_pending && (int32_t)(to_ms_since_boot(get_absolute_time()) - adapter_rename_reenumeration_at) >= 0) {
+        adapter_rename_reenumeration_pending = false;
+        bb_usb_request_reenumeration();
+    }
     while (tud_cdc_available()) {
         char c;
         if (tud_cdc_read(&c, 1) != 1) break;

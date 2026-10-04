@@ -76,7 +76,7 @@ void bb_state_init(void) {
     runtime_state.report.hat = 0;
     if (!bb_config_load(&config_state)) {
         init_defaults(&config_state);
-    } else if (config_state.schema == 8 || config_state.schema == 9) {
+    } else if (config_state.schema == 8 || config_state.schema == 9 || config_state.schema == 10) {
         config_state.schema = BB_CONFIG_SCHEMA;
         if (config_state.output_mode < BB_OUTPUT_MISTER || config_state.output_mode > BB_OUTPUT_SWITCH) config_state.output_mode = BB_OUTPUT_MISTER;
         config_save_pending = true;
@@ -606,6 +606,27 @@ bool bb_profile_share_mapping(uint8_t profile_index, uint8_t target_index) {
     return ok;
 }
 
+bool bb_adapter_rename(const char* name) {
+    if (!name || strlen(name) >= BB_MAX_NAME) return false;
+    critical_section_enter_blocking(&lock);
+    set_name(config_state.adapter_name, sizeof(config_state.adapter_name), name, "");
+    config_save_pending = true;
+    critical_section_exit(&lock);
+    return true;
+}
+
+void bb_adapter_custom_name_get(char* out, size_t size) {
+    if (!out || !size) return;
+    critical_section_enter_blocking(&lock);
+    set_name(out, size, config_state.adapter_name, "");
+    critical_section_exit(&lock);
+}
+
+void bb_adapter_name_get(char* out, size_t size) {
+    bb_adapter_custom_name_get(out, size);
+    if (out && size && !out[0]) set_name(out, size, "", "MC BlueBridge adapter");
+}
+
 bool bb_controller_rename(uint8_t index, const char* name) {
     if (!name || strlen(name) >= BB_MAX_NAME) return false;
     critical_section_enter_blocking(&lock);
@@ -781,7 +802,7 @@ const char* bb_output_mode_name(bb_output_mode_t mode) {
 }
 
 bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
-    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8 && cfg->schema != 9) || bb_config_checksum(cfg) != checksum) return false;
+    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8 && cfg->schema != 9 && cfg->schema != 10) || bb_config_checksum(cfg) != checksum) return false;
     if (cfg->controller_count > BB_MAX_CONTROLLERS) return false;
     if (cfg->controller_count && cfg->active_controller >= cfg->controller_count) return false;
     for (uint8_t i = 0; i < cfg->controller_count; ++i) {
@@ -790,6 +811,11 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
     }
     bb_config_t value = *cfg;
     value.schema = BB_CONFIG_SCHEMA;
+    if (cfg->schema != BB_CONFIG_SCHEMA) memset(value.adapter_name, 0, sizeof(value.adapter_name));
+    value.adapter_name[BB_MAX_NAME - 1] = 0;
+    char clean_adapter_name[BB_MAX_NAME] = {0};
+    set_name(clean_adapter_name, sizeof(clean_adapter_name), value.adapter_name, "");
+    memcpy(value.adapter_name, clean_adapter_name, sizeof(clean_adapter_name));
     for (uint8_t i = 0; i < BB_MAX_CONTROLLERS; ++i) {
         value.controller_names[i][BB_MAX_NAME - 1] = 0;
         char clean[BB_MAX_NAME] = {0};

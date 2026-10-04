@@ -120,13 +120,16 @@ uint8_t const* tud_hid_descriptor_report_cb(uint8_t instance) {
 }
 
 static uint16_t str_desc[64];
+static char adapter_product_name[BB_MAX_NAME];
 static char serial_string[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
 
 static const char* string_for_index(uint8_t index) {
     bb_output_mode_t mode = bb_output_mode();
     switch (index) {
         case 1: return mode == BB_OUTPUT_SWITCH ? "MC BlueBridge" : mode == BB_OUTPUT_XINPUT ? "MC BlueBridge" : "MC BlueBridge";
-        case 2: return mode == BB_OUTPUT_SWITCH ? "MC BlueBridge Switch" : mode == BB_OUTPUT_XINPUT ? "MC BlueBridge X-Input" : mode == BB_OUTPUT_MISTER ? "MC BlueBridge MiSTer" : "MC BlueBridge Generic HID";
+        case 2:
+            bb_adapter_name_get(adapter_product_name, sizeof(adapter_product_name));
+            return adapter_product_name;
         case 3:
             if (!serial_string[0]) pico_get_unique_board_id_string(serial_string, sizeof(serial_string));
             return serial_string;
@@ -151,7 +154,31 @@ uint16_t const* tud_descriptor_string_cb(uint8_t index, uint16_t langid) {
     if (!text) return NULL;
     size_t n = strlen(text);
     if (n > 63) n = 63;
-    for (size_t i = 0; i < n; ++i) str_desc[1 + i] = text[i];
-    str_desc[0] = (TUSB_DESC_STRING << 8) | (2 * n + 2);
+    size_t count = 0;
+    for (size_t i = 0; i < n && count < 63;) {
+        uint32_t code = (uint8_t)text[i++];
+        unsigned extra = code >= 0xc2 && code <= 0xdf ? 1 : code >= 0xe0 && code <= 0xef ? 2 : code >= 0xf0 && code <= 0xf4 ? 3 : 0;
+        if (extra) {
+            uint32_t value = code & ((1u << (6u - extra)) - 1u);
+            bool valid = i + extra <= n;
+            for (unsigned j = 0; valid && j < extra; ++j) {
+                uint8_t byte = (uint8_t)text[i + j];
+                if ((byte & 0xc0u) != 0x80u) valid = false;
+                else value = (value << 6) | (byte & 0x3fu);
+            }
+            uint32_t minimum = extra == 1 ? 0x80u : extra == 2 ? 0x800u : 0x10000u;
+            if (valid && value >= minimum && value <= 0x10ffffu && !(value >= 0xd800u && value <= 0xdfffu)) {
+                code = value;
+                i += extra;
+            } else code = 0xfffdu;
+        } else if (code >= 0x80u) code = 0xfffdu;
+        if (code > 0xffffu) {
+            if (count + 2 > 63) break;
+            code -= 0x10000u;
+            str_desc[++count] = (uint16_t)(0xd800u | (code >> 10));
+            str_desc[++count] = (uint16_t)(0xdc00u | (code & 0x3ffu));
+        } else str_desc[++count] = (uint16_t)code;
+    }
+    str_desc[0] = (TUSB_DESC_STRING << 8) | (2 * count + 2);
     return str_desc;
 }
