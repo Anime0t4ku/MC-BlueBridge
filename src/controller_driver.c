@@ -35,9 +35,19 @@ static uint16_t n64_above[2] = {2047, 2047};
 
 static void submit_state(const bb_input_state_t* state) {
     if (!state) return;
-    last_input_state = *state;
+    bb_input_state_t normalized = *state;
+    if (identity.kind == BB_CONTROLLER_8BITDO && (strstr(identity.name, "Arcade Stick") || strstr(identity.name, "M30"))) {
+        if (normalized.lt > 8) normalized.buttons |= 1u << 6;
+        if (normalized.rt > 8) normalized.buttons |= 1u << 7;
+        normalized.lt = normalized.rt = 0;
+        if (strstr(identity.name, "Arcade Stick")) {
+            normalized.buttons &= 0x000033ffu;
+            bb_state_update_button_capabilities(0x000033ffu);
+        }
+    }
+    last_input_state = normalized;
     have_last_input_state = true;
-    bb_input_submit(state);
+    bb_input_submit(&normalized);
 }
 
 static int16_t axis12_quantized(uint16_t value, uint16_t center, uint16_t range) {
@@ -85,6 +95,17 @@ static int16_t generic_axis(int32_t value) {
     if (value < -32768) return -32768;
     if (value > 32767) return 32767;
     return (int16_t)value;
+}
+
+static int16_t hid_axis(int32_t value, int32_t minimum, int32_t maximum) {
+    int64_t span = (int64_t)maximum - minimum;
+    if (span <= 0) return 0;
+    if (value < minimum) value = minimum;
+    if (value > maximum) value = maximum;
+    int64_t centered = (int64_t)value * 2 - minimum - maximum;
+    if (centered >= -1 && centered <= 1) return 0;
+    int64_t scaled = centered * 32767 / span;
+    return (int16_t)scaled;
 }
 
 static int16_t dinput_axis(int32_t value) {
@@ -193,6 +214,31 @@ static void map_button_bit(uint32_t src_buttons, uint32_t src_caps, uint8_t src_
     if (src_index < 32 && (src_caps & (1u << src_index))) *dst_caps |= 1u << dst_index;
 }
 
+static bool eightbitdo_name_has(const char* part) {
+    size_t n = strlen(part);
+    for (const char* name = identity.name; *name; ++name) {
+        size_t i = 0;
+        while (i < n && name[i]) {
+            char c = name[i];
+            if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+            if (c != part[i]) break;
+            ++i;
+        }
+        if (i == n) return true;
+    }
+    return false;
+}
+
+static void map_8bitdo_layout(bb_input_state_t* state, uint32_t* capabilities, const uint8_t* targets, uint8_t count) {
+    uint32_t buttons = 0;
+    uint32_t caps = 0;
+    for (uint8_t i = 0; i < count; ++i) {
+        if (targets[i] < BB_BUTTON_COUNT) map_button_bit(state->buttons, *capabilities, i, &buttons, &caps, targets[i]);
+    }
+    state->buttons = buttons;
+    *capabilities = caps;
+}
+
 static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabilities, bool analog_lt, bool analog_rt) {
     if (!state || !capabilities) return;
     uint32_t src_buttons = state->buttons;
@@ -200,6 +246,17 @@ static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabili
     uint32_t dst_buttons = 0;
     uint32_t dst_caps = 0;
     bool pro3 = strstr(identity.name, "Pro 3") || strstr(identity.name, "PRO 3") || strstr(identity.name, "pro 3");
+    bool arcade = eightbitdo_name_has("arcade stick") || eightbitdo_name_has("nes30 arcade");
+    bool model = arcade || eightbitdo_name_has("m30") || eightbitdo_name_has("sn30") || eightbitdo_name_has("sf30") || eightbitdo_name_has("pro 2") || eightbitdo_name_has("ultimate") || eightbitdo_name_has("lite") || eightbitdo_name_has("zero");
+    if (!pro3 && model) {
+        static const uint8_t sequential[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13};
+        static const uint8_t paddles[] = {0,1,17,2,3,16,4,5,6,7,8,9,12,10,11,13};
+        if (src_caps & 0xffffc000u) map_8bitdo_layout(state, capabilities, paddles, sizeof(paddles));
+        else map_8bitdo_layout(state, capabilities, sequential, sizeof(sequential));
+        if (!analog_lt && (state->buttons & (1u << 6))) state->lt = 255;
+        if (!analog_rt && (state->buttons & (1u << 7))) state->rt = 255;
+        return;
+    }
     map_button_bit(src_buttons, src_caps, 0, &dst_buttons, &dst_caps, 1);
     map_button_bit(src_buttons, src_caps, 1, &dst_buttons, &dst_caps, 0);
     map_button_bit(src_buttons, src_caps, 3, &dst_buttons, &dst_caps, 3);
@@ -834,10 +891,10 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             }
         }
         switch (usage) {
-            case HID_USAGE_X: s.x = generic_axis(value); break;
-            case HID_USAGE_Y: s.y = generic_axis(value); break;
-            case HID_USAGE_RX: s.rx = generic_axis(value); break;
-            case HID_USAGE_RY: s.ry = generic_axis(value); break;
+            case HID_USAGE_X: s.x = hid_axis(value, minimum, maximum); break;
+            case HID_USAGE_Y: s.y = hid_axis(value, minimum, maximum); break;
+            case HID_USAGE_RX: s.rx = hid_axis(value, minimum, maximum); break;
+            case HID_USAGE_RY: s.ry = hid_axis(value, minimum, maximum); break;
             case HID_USAGE_Z: s.lt = generic_trigger(value, minimum, maximum); analog_lt = true; break;
             case HID_USAGE_RZ: s.rt = generic_trigger(value, minimum, maximum); analog_rt = true; break;
             case HID_USAGE_HAT: s.dpad = hat_to_dpad(value); break;
@@ -848,10 +905,24 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
         normalize_8bitdo_buttons(&s, &button_capabilities, analog_lt, analog_rt);
     }
+    if (identity.kind == BB_CONTROLLER_8BITDO && (eightbitdo_name_has("m30") || eightbitdo_name_has("arcade stick"))) {
+        if (s.lt > 8) s.buttons |= 1u << 6;
+        if (s.rt > 8) s.buttons |= 1u << 7;
+        if (analog_lt) button_capabilities |= 1u << 6;
+        if (analog_rt) button_capabilities |= 1u << 7;
+        s.lt = s.rt = 0;
+    }
     s.buttons = canonicalize_buttons(s.buttons);
     bb_state_update_button_capabilities(canonicalize_buttons(button_capabilities));
     submit_state(&s);
     return true;
+}
+
+static bool parse_8bitdo_arcade(const uint8_t* report, uint16_t length) {
+    if (report[0] == 0x30) return parse_switch_full(report, length);
+    if (report[0] == 0x3f) return parse_switch_simple(report, length);
+    if (report[0] == 0x21) return true;
+    return parse_generic(report, length);
 }
 
 void bb_driver_reset(void) {
@@ -887,6 +958,7 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
     }
     bb_state_update_battery(false, 0, 0);
     bool rumble = identity.kind == BB_CONTROLLER_DUALSENSE || identity.kind == BB_CONTROLLER_DUALSENSE_EDGE || identity.kind == BB_CONTROLLER_DUALSHOCK4 || identity.kind == BB_CONTROLLER_DUALSHOCK3 || identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_WII_U_PRO || identity.kind == BB_CONTROLLER_8BITDO;
+    if (identity.kind == BB_CONTROLLER_8BITDO && (eightbitdo_name_has("arcade stick") || eightbitdo_name_has("m30"))) rumble = false;
     bb_state_set_rumble_supported(rumble);
 }
 
@@ -909,6 +981,13 @@ static bool descriptor_has(const uint8_t* descriptor, uint16_t length, const uin
 
 bool bb_driver_refine_identity_from_hid_descriptor(const uint8_t* descriptor, uint16_t length, bb_controller_identity_t* value) {
     if (!descriptor || !value || value->kind != BB_CONTROLLER_GENERIC || length < 32) return false;
+    static const uint8_t switch_full[] = {0x85,0x30};
+    static const uint8_t switch_simple[] = {0x85,0x3f};
+    if (descriptor_has(descriptor, length, switch_full, sizeof(switch_full)) && descriptor_has(descriptor, length, switch_simple, sizeof(switch_simple))) {
+        value->kind = BB_CONTROLLER_SWITCH_PRO;
+        memcpy(value->name, "Switch Pro Controller", sizeof("Switch Pro Controller"));
+        return true;
+    }
     static const uint8_t ds5_output[] = {0x85,0x31,0x09,0x31,0x91,0x02};
     static const uint8_t ds5_output_alt[] = {0x85,0x31};
     static const uint8_t ds4_output[] = {0x85,0x11};
@@ -997,6 +1076,7 @@ bool bb_driver_handle_hid_report(const uint8_t* report, uint16_t length) {
         if (id == 0x30) return parse_n64_full(report, length);
         return id == 0x21 || id == 0x3f;
     }
+    if (identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("arcade stick")) return parse_8bitdo_arcade(report, length);
     if (identity.kind == BB_CONTROLLER_8BITDO && parse_8bitdo_enhanced(report, length)) return true;
     if (identity.kind == BB_CONTROLLER_NSO_NES || identity.kind == BB_CONTROLLER_NSO_SNES || identity.kind == BB_CONTROLLER_NSO_GENESIS) {
         if (id == 0x21) return true;

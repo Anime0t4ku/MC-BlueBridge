@@ -182,6 +182,7 @@ void bb_input_submit(const bb_input_state_t* state) {
 }
 
 bb_controller_kind_t bb_controller_identify(uint16_t vid, uint16_t pid, const char* name) {
+    if (contains_ci(name, "8bitdo") || contains_ci(name, "pro 3")) return BB_CONTROLLER_8BITDO;
     if (vid == 0x054c) {
         if (pid == 0x0ce6) return BB_CONTROLLER_DUALSENSE;
         if (pid == 0x0df2) return BB_CONTROLLER_DUALSENSE_EDGE;
@@ -341,7 +342,15 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
         case BB_CONTROLLER_8BITDO:
             c.buttons = 0x00003fffu;
             if (contains_ci(name, "pro 3")) c.buttons = 0x000f1fffu;
-            else if (contains_ci(name, "ultimate")) c.buttons = 0x000c3fffu;
+            else if (contains_ci(name, "ultimate") || contains_ci(name, "pro 2")) c.buttons = 0x00033fffu;
+            else if (contains_ci(name, "arcade stick")) {
+                c.buttons = 0x000033ffu;
+                c.left_trigger = c.right_trigger = 0;
+            }
+            else if (contains_ci(name, "m30")) {
+                c.left_stick = c.right_stick = 0;
+                c.left_trigger = c.right_trigger = 0;
+            }
             break;
         case BB_CONTROLLER_XBOX_ELITE:
             c.buttons = 0x000f1fffu;
@@ -416,7 +425,8 @@ void bb_controller_display_name(bb_controller_kind_t kind, const char* raw_name,
     if (!out || !out_size) return;
     const char* value = bb_controller_kind_name(kind);
     if (kind == BB_CONTROLLER_8BITDO) {
-        if (contains_ci(raw_name, "pro 3")) value = "8BitDo Pro 3";
+        if (contains_ci(raw_name, "arcade stick") || contains_ci(raw_name, "nes30 arcade")) value = "8BitDo Arcade Stick";
+        else if (contains_ci(raw_name, "pro 3")) value = "8BitDo Pro 3";
         else if (contains_ci(raw_name, "pro 2")) value = "8BitDo Pro 2";
         else if (contains_ci(raw_name, "ultimate")) value = "8BitDo Ultimate Controller";
         else if (contains_ci(raw_name, "sn30")) value = "8BitDo SN30 Controller";
