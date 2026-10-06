@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 void bb_bt_host_init(void);
 void bb_bt_host_start_pairing(void);
 void bb_bt_host_stop_pairing(void);
@@ -10,3 +11,5 @@ bool bb_bt_host_disconnect_current(void);
 bool bb_bt_host_rumble_test(uint8_t strength, uint16_t duration_ms);
 
 void bb_bt_host_set_output_rumble(uint8_t left, uint8_t right);
+
+bool bb_bt_host_diagnostics(char* out, size_t size);

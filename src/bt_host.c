@@ -1,4 +1,5 @@
 #include "bt_host.h"
+#include <stdio.h>
 #include "bluebridge_state.h"
 #include "controller_driver.h"
 #include "controller_input.h"
@@ -41,6 +42,7 @@ static uint16_t identity_query_vid;
 static uint16_t identity_query_pid;
 static uint16_t identity_query_source;
 static uint8_t identity_attribute[3];
+static uint32_t arcade_battery_poll_at;
 static bool connected_name_request;
 static bd_addr_t connected_name_addr;
 static uint16_t classic_hid_cid;
@@ -53,6 +55,17 @@ static bool scanning;
 static bool pairing;
 static bool classic_connecting;
 static bool ble_connecting;
+static uint32_t ble_attempt_started;
+static bool ble_setup_started;
+static bool ble_bond_retry;
+static const char* ble_stage = "idle";
+static const char* ble_failed_stage = "none";
+static int16_t ble_setup_status = -1;
+static int16_t ble_pairing_reason = -1;
+static uint8_t ble_key_minimum = 16;
+static uint8_t ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION;
+static char ble_peer_name[32];
+static uint32_t ble_attempt_count;
 static bool le_custom_nintendo;
 static bool le_gamecube;
 static bd_addr_t pending_addr;
@@ -654,6 +667,7 @@ static void refresh_classic_identity(const char* name, uint16_t vid, uint16_t pi
     if (vid) updated.vendor_id = vid;
     if (pid) updated.product_id = pid;
     const char* resolved = name && name[0] ? name : current_identity.name;
+    if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "arcade stick") && name_has(resolved, "pro controller")) resolved = current_identity.name;
     bb_controller_kind_t kind = bb_controller_identify(updated.vendor_id, updated.product_id, resolved);
     if (kind != BB_CONTROLLER_GENERIC) updated.kind = kind;
     bb_controller_display_name(updated.kind, resolved, updated.name, sizeof(updated.name));
@@ -754,6 +768,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     classic_attempt_active = false;
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
     ble_connecting = false;
+    if (le_handle != HCI_CON_HANDLE_INVALID) ble_stage = "active";
     classic_reconnect_at = 0;
 
     gap_discoverable_control(1);
@@ -767,6 +782,7 @@ static void controller_disconnected(void) {
     xbox_battery_cid = 0;
     if (battery_cid) battery_service_client_disconnect(battery_cid);
     classic_generation++;
+    arcade_battery_poll_at = 0;
     identity_query_pending = false;
     connected_name_request = false;
     reset_classic_name_candidates();
@@ -783,6 +799,10 @@ static void controller_disconnected(void) {
     classic_attempt_active = false;
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
     ble_connecting = false;
+    sm_set_encryption_key_size_range(16, 16);
+    sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+    ble_setup_started = false;
+    if (!strcmp(ble_failed_stage, "none")) ble_stage = "disconnected";
     le_custom_nintendo = false;
     le_gamecube = false;
     le_handle = HCI_CON_HANDLE_INVALID;
@@ -855,19 +875,49 @@ static void connect_classic(const uint8_t addr[6], const char* name) {
     }
 }
 
+static bool ble_is_8bitdo64(const char* name) {
+    static const char* aliases[] = {"8BitDo 64 Bluetooth Controller", "8BitDo 64 Controller", "8BitDo 64", "8BitDo 64 BT"};
+    if (name) {
+        for (uint8_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i) {
+            if (strlen(name) == strlen(aliases[i]) && name_has(name, aliases[i])) return true;
+        }
+    }
+    return false;
+}
+
+static void configure_ble_security(void) {
+    ble_key_minimum = 16;
+    ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION;
+    sm_set_authentication_requirements(ble_authentication);
+    sm_set_encryption_key_size_range(ble_key_minimum, 16);
+}
+
 static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const char* name, bool custom_nintendo, bool gamecube, uint16_t vid, uint16_t pid) {
-    if (connection_in_progress()) return;
+    const char* resolved_name = name && name[0] ? name : remembered_name(addr);
+    if (ble_is_8bitdo64(resolved_name) || connection_in_progress()) return;
     ble_connecting = true;
+    ble_attempt_started = btstack_run_loop_get_time_ms();
+    ble_setup_started = false;
+    ble_bond_retry = false;
+    ble_stage = "connecting";
+    ble_failed_stage = "none";
+    ble_setup_status = -1;
+    ble_pairing_reason = -1;
+    copy_name(ble_peer_name, sizeof(ble_peer_name), resolved_name);
+    configure_ble_security();
+    ++ble_attempt_count;
     stop_scans();
     memcpy(pending_addr, addr, 6);
     pending_addr_type = addr_type;
-    copy_name(pending_name, sizeof(pending_name), name);
+    copy_name(pending_name, sizeof(pending_name), resolved_name);
     pending_vid = vid;
     pending_pid = pid;
     le_custom_nintendo = custom_nintendo;
     le_gamecube = gamecube;
     uint8_t status = gap_connect(pending_addr, pending_addr_type);
     if (status != ERROR_CODE_SUCCESS) {
+        sm_set_encryption_key_size_range(16, 16);
+        sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
         ble_connecting = false;
         le_custom_nintendo = false;
         start_scans();
@@ -930,6 +980,8 @@ static void xbox_battery_handler(uint8_t packet_type, uint16_t channel, uint8_t*
     }
 }
 
+static void ble_setup_fail(uint8_t status);
+
 static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     (void)channel;
     (void)size;
@@ -937,7 +989,7 @@ static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet,
     switch (hci_event_gattservice_meta_get_subevent_code(packet)) {
         case GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED:
             if (gattservice_subevent_hid_service_connected_get_status(packet) != ERROR_CODE_SUCCESS) {
-                gap_disconnect(le_handle);
+                ble_setup_fail(gattservice_subevent_hid_service_connected_get_status(packet));
                 return;
             }
             activate_controller(pending_addr, pending_addr_type, pending_vid, pending_pid, pending_name);
@@ -968,6 +1020,23 @@ static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet,
     }
 }
 
+static void ble_setup_fail(uint8_t status) {
+    ble_setup_status = status;
+    ble_failed_stage = ble_stage;
+    ble_stage = "disconnecting";
+    if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
+    else {
+        gap_connect_cancel();
+        controller_disconnected();
+    }
+}
+
+static void ble_start_hid(void) {
+    ble_stage = "hid_setup";
+    uint8_t status = hids_host_connect(le_handle, hids_handler, HID_PROTOCOL_MODE_REPORT, &hids_cid);
+    if (status != ERROR_CODE_SUCCESS) ble_setup_fail(status);
+}
+
 static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     (void)channel;
     if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || size < 6 || hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META) return;
@@ -981,7 +1050,7 @@ static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t*
             break;
         case GATTSERVICE_SUBEVENT_DEVICE_INFORMATION_DONE:
             if (gattservice_subevent_device_information_done_get_con_handle(packet) == le_handle && le_handle != HCI_CON_HANDLE_INVALID) {
-                if (hids_host_connect(le_handle, hids_handler, HID_PROTOCOL_MODE_REPORT, &hids_cid) != ERROR_CODE_SUCCESS) gap_disconnect(le_handle);
+                ble_start_hid();
             }
             break;
         default:
@@ -991,32 +1060,52 @@ static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t*
 
 static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     (void)channel;
-    (void)size;
-    if (packet_type != HCI_EVENT_PACKET) return;
-    bool ready = false;
+    if (packet_type != HCI_EVENT_PACKET || size < 5) return;
+    hci_con_handle_t handle;
+    uint8_t status;
+    bool reencrypt = false;
     switch (hci_event_packet_get_type(packet)) {
         case SM_EVENT_JUST_WORKS_REQUEST:
-            sm_just_works_confirm(sm_event_just_works_request_get_handle(packet));
-            break;
+            handle = sm_event_just_works_request_get_handle(packet);
+            if (handle == le_handle) sm_just_works_confirm(handle);
+            return;
         case SM_EVENT_NUMERIC_COMPARISON_REQUEST:
-            sm_numeric_comparison_confirm(sm_event_numeric_comparison_request_get_handle(packet));
-            break;
+            handle = sm_event_numeric_comparison_request_get_handle(packet);
+            if (handle == le_handle) sm_numeric_comparison_confirm(handle);
+            return;
         case SM_EVENT_PAIRING_COMPLETE:
-            ready = sm_event_pairing_complete_get_status(packet) == ERROR_CODE_SUCCESS;
+            if (size < 13) return;
+            handle = sm_event_pairing_complete_get_handle(packet);
+            status = sm_event_pairing_complete_get_status(packet);
             break;
         case SM_EVENT_REENCRYPTION_COMPLETE:
-            ready = sm_event_reencryption_complete_get_status(packet) == ERROR_CODE_SUCCESS;
+            if (size < 12) return;
+            handle = sm_event_reencryption_complete_get_handle(packet);
+            status = sm_event_reencryption_complete_get_status(packet);
+            reencrypt = true;
             break;
         default:
-            break;
+            return;
     }
-    if (!ready) return;
+    if (handle != le_handle || le_handle == HCI_CON_HANDLE_INVALID || !ble_connecting) return;
+    ble_setup_status = status;
+    ble_pairing_reason = reencrypt ? -1 : sm_event_pairing_complete_get_reason(packet);
+    if (status != ERROR_CODE_SUCCESS) {
+        if (reencrypt && pairing && !ble_bond_retry && !ble_setup_started) {
+            ble_bond_retry = true;
+            ble_stage = "bond_repair";
+            gap_delete_bonding(pending_addr_type, pending_addr);
+            sm_request_pairing(le_handle);
+        } else ble_setup_fail(status);
+        return;
+    }
+    if (ble_setup_started) return;
+    ble_setup_started = true;
     if (le_custom_nintendo) {
         enable_nintendo_notifications();
     } else {
-        if (device_information_service_client_query(le_handle, ble_identity_handler) != ERROR_CODE_SUCCESS) {
-            if (hids_host_connect(le_handle, hids_handler, HID_PROTOCOL_MODE_REPORT, &hids_cid) != ERROR_CODE_SUCCESS) gap_disconnect(le_handle);
-        }
+        ble_stage = "device_information";
+        if (device_information_service_client_query(le_handle, ble_identity_handler) != ERROR_CODE_SUCCESS) ble_start_hid();
     }
 }
 
@@ -1116,7 +1205,7 @@ static void classic_hid_event(uint8_t* packet) {
             const char* known_name = remembered_name(connected_addr);
             const char* resolved_name = pending_name[0] && !name_has(pending_name, "bluetooth controller") ? pending_name : known_name;
             activate_controller(connected_addr, 0, 0, 0, resolved_name);
-            if (current_identity.kind == BB_CONTROLLER_GENERIC || name_has(current_identity.name, "bluetooth controller")) {
+            if (current_identity.kind == BB_CONTROLLER_GENERIC || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || name_has(current_identity.name, "bluetooth controller")) {
                 memcpy(connected_name_addr, connected_addr, sizeof(connected_name_addr));
                 connected_name_request = gap_remote_name_request(connected_name_addr, 0, 0) == ERROR_CODE_SUCCESS;
             }
@@ -1128,7 +1217,7 @@ static void classic_hid_event(uint8_t* packet) {
                 const uint8_t* descriptor = hid_descriptor_storage_get_descriptor_data(classic_hid_cid);
                 uint16_t descriptor_len = hid_descriptor_storage_get_descriptor_len(classic_hid_cid);
                 bb_driver_set_hid_descriptor(descriptor, descriptor_len);
-                if (current_identity.kind == BB_CONTROLLER_GENERIC) identity_query_pending = true;
+                if (current_identity.kind == BB_CONTROLLER_GENERIC || current_identity.kind == BB_CONTROLLER_SWITCH_PRO) identity_query_pending = true;
                 bb_controller_identity_t refined = current_identity;
                 if (bb_driver_refine_identity_from_hid_descriptor(descriptor, descriptor_len, &refined)) {
                     current_identity = refined;
@@ -1144,12 +1233,28 @@ static void classic_hid_event(uint8_t* packet) {
                 if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "pro 3")) hid_host_send_get_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x06);
             }
             break;
+        case HID_SUBEVENT_GET_REPORT_RESPONSE: {
+            if (hid_subevent_get_report_response_get_hid_cid(packet) != classic_hid_cid ||
+                current_identity.kind != BB_CONTROLLER_8BITDO || !name_has(current_identity.name, "arcade stick")) break;
+            uint8_t status = hid_subevent_get_report_response_get_handshake_status(packet);
+            bb_driver_record_battery_response(status, hid_subevent_get_report_response_get_report(packet), hid_subevent_get_report_response_get_report_len(packet));
+            if (status != 0) break;
+            bb_driver_handle_battery_report(hid_subevent_get_report_response_get_report(packet), hid_subevent_get_report_response_get_report_len(packet));
+            break;
+        }
         case HID_SUBEVENT_REPORT: {
             const uint8_t* report = hid_subevent_report_get_report(packet);
             uint16_t len = hid_subevent_report_get_report_len(packet);
             if (len && report[0] == 0xa1) {
                 ++report;
                 --len;
+            }
+            if (len && current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "arcade stick")) {
+                if (len >= 12 && (report[0] == 0x30 || report[0] == 0x3f)) {
+                    if (!name_has(current_identity.name, "s mode")) refresh_classic_identity("8BitDo Arcade Stick - S Mode", 0, 0);
+                } else if (report[0] != 0x21 && report[0] != 0x30 && report[0] != 0x3f && !name_has(current_identity.name, "x mode")) {
+                    refresh_classic_identity("8BitDo Arcade Stick - X Mode", 0, 0);
+                }
             }
             if (len && report[0] == 0x21) switch_setup_ack(report, len);
             if (len && (report[0] == 0x30 || report[0] == 0x3f)) {
@@ -1313,11 +1418,17 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, 
         case HCI_EVENT_META_GAP:
             if (hci_event_gap_meta_get_subevent_code(packet) == GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
                 if (gap_subevent_le_connection_complete_get_status(packet) != ERROR_CODE_SUCCESS) {
+                    sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+                    sm_set_encryption_key_size_range(16, 16);
+                    ble_setup_status = gap_subevent_le_connection_complete_get_status(packet);
+                    ble_failed_stage = "connecting";
+                    ble_stage = "failed";
                     ble_connecting = false;
                     start_scans();
                     break;
                 }
                 le_handle = gap_subevent_le_connection_complete_get_connection_handle(packet);
+                ble_stage = le_custom_nintendo ? "notifications" : "security";
                 if (le_custom_nintendo) enable_nintendo_notifications();
                 else sm_request_pairing(le_handle);
             }
@@ -1377,12 +1488,23 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
             if (wiiu_setup_step > 3) wiiu_setup_step = 0;
         }
     }
+    if (ble_connecting && strcmp(ble_stage, "disconnecting") &&
+        (uint32_t)(now - ble_attempt_started) >= 30000u) ble_setup_fail(ERROR_CODE_CONNECTION_TIMEOUT);
     if (classic_attempt_active && (uint32_t)(now - classic_attempt_started) >= 15000u) {
         uint16_t cid = classic_hid_cid;
         hci_con_handle_t handle = pending_classic_handle;
         if (cid) hid_host_disconnect(cid);
         if (handle != HCI_CON_HANDLE_INVALID) gap_disconnect(handle);
         controller_disconnected();
+    }
+    if (classic_hid_cid && current_controller_index >= 0 && current_identity.kind == BB_CONTROLLER_8BITDO &&
+        name_has(current_identity.name, "arcade stick") && (int32_t)(now - arcade_battery_poll_at) >= 0) {
+        int16_t id = bb_driver_battery_report_id();
+        if (id >= 0) {
+            uint8_t status = hid_host_send_get_report(classic_hid_cid, (hid_report_type_t)bb_driver_battery_report_type(), (uint16_t)id);
+            bb_driver_record_battery_request(status);
+            arcade_battery_poll_at = now + (status == ERROR_CODE_SUCCESS ? 60000u : 1000u);
+        } else arcade_battery_poll_at = now + 1000u;
     }
     service_classic_identity();
     service_switch_setup(now);
@@ -1436,6 +1558,7 @@ void bb_bt_host_init(void) {
     sm_init();
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+    sm_set_encryption_key_size_range(16, 16);
     gatt_client_init();
     device_information_service_client_init();
     battery_service_client_init();
@@ -1570,4 +1693,22 @@ void bb_bt_host_set_output_rumble(uint8_t left, uint8_t right) {
     rumble_request_strength = strength;
     rumble_request_duration_ms = strength ? 1200u : 50u;
     rumble_request_pending = true;
+}
+
+bool bb_bt_host_diagnostics(char* out, size_t size) {
+    if (!out || size < 512) return false;
+    char name_hex[65];
+    static const char digits[] = "0123456789abcdef";
+    size_t name_length = strlen(ble_peer_name);
+    for (size_t i = 0; i < name_length; ++i) {
+        uint8_t value = (uint8_t)ble_peer_name[i];
+        name_hex[i * 2] = digits[value >> 4];
+        name_hex[i * 2 + 1] = digits[value & 15];
+    }
+    name_hex[name_length * 2] = 0;
+    snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s}",
+        name_hex, ble_key_minimum, ble_authentication, ble_pairing_reason, ble_stage, ble_failed_stage, ble_setup_status, (unsigned long)ble_attempt_count,
+        ble_connecting ? "true" : "false", le_handle, hids_cid, current_controller_index,
+        classic_connecting ? "true" : "false", classic_attempt_active ? "true" : "false");
+    return true;
 }

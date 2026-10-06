@@ -4,6 +4,7 @@
 #include "usb_device.h"
 #include "led_status.h"
 #include "controller_input.h"
+#include "controller_driver.h"
 #include "bt_host.h"
 #include "pico/bootrom.h"
 #include "pico/stdlib.h"
@@ -231,6 +232,20 @@ static void handle_command(char* text) {
             adapter_rename_reenumeration_at = to_ms_since_boot(get_absolute_time()) + 150u;
             adapter_rename_reenumeration_pending = true;
         }
+        return;
+    }
+    if (!strcmp(cmd, "BT_DIAGNOSTICS")) {
+        char out[512];
+        if (bb_bt_host_diagnostics(out, sizeof(out))) send_ok(id, out);
+        else send_err(id, "bt_diagnostics");
+        return;
+    }
+    if (!strcmp(cmd, "HID_DIAGNOSTICS")) {
+        char* value = next_field(&cursor);
+        long offset = value ? strtol(value, NULL, 10) : 0;
+        char out[1024];
+        if (offset < 0 || offset > 65535 || !bb_driver_hid_diagnostics((uint16_t)offset, out, sizeof(out))) send_err(id, "hid_offset");
+        else send_ok(id, out);
         return;
     }
     if (!strcmp(cmd, "STATUS")) {

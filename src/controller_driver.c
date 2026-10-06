@@ -2,6 +2,7 @@
 #include "bluebridge_state.h"
 #include "btstack.h"
 #include <string.h>
+#include <stdio.h>
 
 #define BB_DPAD_UP 1
 #define BB_DPAD_DOWN 2
@@ -19,6 +20,17 @@
 #define HID_USAGE_HAT 0x39
 #define HID_USAGE_BATTERY_STRENGTH 0x20
 
+static uint8_t early_arcade_battery_report[2];
+static bool have_early_arcade_battery_report;
+static int16_t diagnostic_battery_request_status = -1;
+static uint32_t diagnostic_battery_request_count;
+static uint8_t diagnostic_battery_response[32];
+static uint8_t diagnostic_battery_response_length;
+static int16_t diagnostic_battery_status = -1;
+static uint8_t diagnostic_report[64];
+static uint16_t diagnostic_report_length;
+static uint16_t diagnostic_report_original_length;
+static uint32_t diagnostic_report_sequence;
 static bb_controller_identity_t identity;
 static const uint8_t* hid_descriptor;
 static uint16_t hid_descriptor_len;
@@ -41,8 +53,8 @@ static void submit_state(const bb_input_state_t* state) {
         if (normalized.rt > 8) normalized.buttons |= 1u << 7;
         normalized.lt = normalized.rt = 0;
         if (strstr(identity.name, "Arcade Stick")) {
-            normalized.buttons &= 0x000033ffu;
-            bb_state_update_button_capabilities(0x000033ffu);
+            normalized.buttons &= 0x000013ffu;
+            bb_state_update_button_capabilities(0x000013ffu);
         }
     }
     last_input_state = normalized;
@@ -247,7 +259,18 @@ static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabili
     uint32_t dst_caps = 0;
     bool pro3 = strstr(identity.name, "Pro 3") || strstr(identity.name, "PRO 3") || strstr(identity.name, "pro 3");
     bool arcade = eightbitdo_name_has("arcade stick") || eightbitdo_name_has("nes30 arcade");
-    bool model = arcade || eightbitdo_name_has("m30") || eightbitdo_name_has("sn30") || eightbitdo_name_has("sf30") || eightbitdo_name_has("pro 2") || eightbitdo_name_has("ultimate") || eightbitdo_name_has("lite") || eightbitdo_name_has("zero");
+    if (arcade) {
+        static const uint8_t xinput[] = {1,0,3,2,4,5,8,9,4,5,12,255,12};
+        map_8bitdo_layout(state, capabilities, xinput, sizeof(xinput));
+        return;
+    }
+    if (eightbitdo_name_has("m30")) {
+        static const uint8_t layout[] = {1,0,12,3,2,255,4,5,6,7,8,9,12};
+        map_8bitdo_layout(state, capabilities, layout, sizeof(layout));
+        state->lt = state->rt = 0;
+        return;
+    }
+    bool model = eightbitdo_name_has("m30") || eightbitdo_name_has("sn30") || eightbitdo_name_has("sf30") || eightbitdo_name_has("pro 2") || eightbitdo_name_has("ultimate") || eightbitdo_name_has("lite") || eightbitdo_name_has("zero");
     if (!pro3 && model) {
         static const uint8_t sequential[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13};
         static const uint8_t paddles[] = {0,1,17,2,3,16,4,5,6,7,8,9,12,10,11,13};
@@ -349,6 +372,26 @@ static bool parse_n64_full(const uint8_t* p, uint16_t len) {
     bb_state_update_battery(true, level >= 8 ? 100 : level * 100u / 8u, (battery & 1) ? 2 : 1);
     bb_state_update_button_capabilities(0x00003effu);
     submit_state(&s);
+    return true;
+}
+
+static bool parse_n64_simple(const uint8_t* report, uint16_t length) {
+    if (length != 12 || report[0] != 0x3f) return false;
+    bb_input_state_t state;
+    bb_input_clear(&state);
+    uint16_t buttons = little_endian_read_16(report, 1);
+    static const uint8_t target[] = {1,0,11,2,4,5,6,7,3,9,10,255,12,13};
+    for (uint8_t i = 0; i < sizeof(target); ++i) {
+        if (target[i] != 255 && (buttons & (1u << i))) state.buttons |= 1u << target[i];
+    }
+    uint8_t hat = report[3] & 15;
+    if (hat < 8) state.dpad = hat_to_dpad(hat);
+    state.x = hid_axis(little_endian_read_16(report, 4), 0, 65535);
+    state.y = hid_axis(little_endian_read_16(report, 6), 0, 65535);
+    state.lt = (state.buttons & (1u << 6)) ? 255 : 0;
+    state.rt = (state.buttons & (1u << 10)) ? 255 : 0;
+    bb_state_update_button_capabilities(0x00003effu);
+    submit_state(&state);
     return true;
 }
 
@@ -847,6 +890,16 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
     bb_input_state_t s;
     bb_input_clear(&s);
     uint32_t button_capabilities = 0;
+    bool arcade = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("arcade stick");
+    bool m30 = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("m30");
+    if (arcade || m30) {
+        bool numbered = btstack_hid_report_id_declared(hid_descriptor, hid_descriptor_len);
+        int expected = btstack_hid_get_report_size_for_id(numbered ? report[0] : HID_REPORT_ID_UNDEFINED, HID_REPORT_TYPE_INPUT, hid_descriptor, hid_descriptor_len);
+        if (expected <= 0 || length < expected + numbered) return false;
+    }
+    bool home_present = false;
+    bool home_pressed = false;
+    bool primary_input = false;
     int32_t axes[6] = {0};
     bool axis_present[6] = {false};
     int32_t axis_minimum[6] = {0};
@@ -858,10 +911,19 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         uint16_t page = 0;
         uint16_t usage = 0;
         int32_t value = 0;
-        int32_t minimum = parser.usage_iterator.global_logical_minimum;
+        int32_t minimum = m30 ? parser.descriptor_usage_item.global_logical_minimum : parser.usage_iterator.global_logical_minimum;
         int32_t maximum = parser.usage_iterator.global_logical_maximum;
         btstack_hid_parser_get_field(&parser, &page, &usage, &value);
+        if (arcade && ((page == HID_USAGE_PAGE_GENERIC_DESKTOP && usage == 0x85) || (page == 0x0c && usage == 0x0223))) {
+            home_present = true;
+            home_pressed |= value != 0;
+            continue;
+        }
         if (page == HID_USAGE_PAGE_BUTTON) {
+            if (arcade && (usage == 11 || usage == 13)) {
+                home_present = true;
+                home_pressed |= value != 0;
+            } else primary_input = true;
             if (usage >= 1 && usage <= BB_BUTTON_COUNT) {
                 button_capabilities |= 1u << (usage - 1);
                 if (value) s.buttons |= 1u << (usage - 1);
@@ -874,6 +936,7 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             continue;
         }
         if (page != HID_USAGE_PAGE_GENERIC_DESKTOP) continue;
+        if (usage >= HID_USAGE_X && usage <= HID_USAGE_HAT) primary_input = true;
         if (identity.kind == BB_CONTROLLER_8BITDO) {
             int index = -1;
             if (usage == HID_USAGE_X) index = 0;
@@ -897,12 +960,28 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             case HID_USAGE_RY: s.ry = hid_axis(value, minimum, maximum); break;
             case HID_USAGE_Z: s.lt = generic_trigger(value, minimum, maximum); analog_lt = true; break;
             case HID_USAGE_RZ: s.rt = generic_trigger(value, minimum, maximum); analog_rt = true; break;
-            case HID_USAGE_HAT: s.dpad = hat_to_dpad(value); break;
+            case HID_USAGE_HAT:
+                if (arcade || m30) s.dpad = value >= minimum && value <= maximum ? hat_to_dpad(value - minimum) : 0;
+                else s.dpad = hat_to_dpad(value);
+                break;
             default: break;
         }
     }
     if (identity.kind == BB_CONTROLLER_8BITDO) {
-        apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
+        if (m30) {
+            const uint8_t pairs[][2] = {{0,1},{2,5},{3,4}};
+            for (uint8_t pair = 0; pair < 3; ++pair) {
+                uint8_t x = pairs[pair][0];
+                uint8_t y = pairs[pair][1];
+                if (!axis_present[x] || !axis_present[y]) continue;
+                int16_t dx = hid_axis(axes[x], axis_minimum[x], axis_maximum[x]);
+                int16_t dy = hid_axis(axes[y], axis_minimum[y], axis_maximum[y]);
+                if (dx < -16384) s.dpad |= 4;
+                if (dx > 16384) s.dpad |= 8;
+                if (dy < -16384) s.dpad |= 1;
+                if (dy > 16384) s.dpad |= 2;
+            }
+        } else apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
         normalize_8bitdo_buttons(&s, &button_capabilities, analog_lt, analog_rt);
     }
     if (identity.kind == BB_CONTROLLER_8BITDO && (eightbitdo_name_has("m30") || eightbitdo_name_has("arcade stick"))) {
@@ -912,16 +991,94 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         if (analog_rt) button_capabilities |= 1u << 7;
         s.lt = s.rt = 0;
     }
+    if (arcade && home_present) {
+        if (!primary_input && have_last_input_state) s = last_input_state;
+        s.buttons &= ~(1u << 12);
+        if (home_pressed) s.buttons |= 1u << 12;
+        button_capabilities |= 1u << 12;
+    } else if (arcade && have_last_input_state) {
+        s.buttons |= last_input_state.buttons & (1u << 12);
+    }
     s.buttons = canonicalize_buttons(s.buttons);
     bb_state_update_button_capabilities(canonicalize_buttons(button_capabilities));
     submit_state(&s);
     return true;
 }
 
+static int16_t battery_report_for_type(hid_report_type_t type) {
+    if (!hid_descriptor || !hid_descriptor_len) return -1;
+    btstack_hid_usage_iterator_t iterator;
+    btstack_hid_usage_iterator_init(&iterator, hid_descriptor, hid_descriptor_len, type);
+    while (btstack_hid_usage_iterator_has_more(&iterator)) {
+        btstack_hid_usage_item_t item;
+        btstack_hid_usage_iterator_get_item(&iterator, &item);
+        if (item.usage_page == HID_USAGE_PAGE_GENERIC_DEVICE && item.usage == HID_USAGE_BATTERY_STRENGTH) {
+            return item.report_id == HID_REPORT_ID_UNDEFINED ? 0 : (int16_t)item.report_id;
+        }
+    }
+    return -1;
+}
+
+int16_t bb_driver_battery_report_id(void) {
+    int16_t id = battery_report_for_type(HID_REPORT_TYPE_INPUT);
+    return id >= 0 ? id : battery_report_for_type(HID_REPORT_TYPE_FEATURE);
+}
+
+uint8_t bb_driver_battery_report_type(void) {
+    if (battery_report_for_type(HID_REPORT_TYPE_INPUT) >= 0) return HID_REPORT_TYPE_INPUT;
+    return battery_report_for_type(HID_REPORT_TYPE_FEATURE) >= 0 ? HID_REPORT_TYPE_FEATURE : 0;
+}
+
+bool bb_driver_handle_battery_report(const uint8_t* report, uint16_t length) {
+    int16_t id = bb_driver_battery_report_id();
+    hid_report_type_t type = (hid_report_type_t)bb_driver_battery_report_type();
+    if (id < 0 || !report || !length || (id && report[0] != id)) return false;
+    int expected = btstack_hid_get_report_size_for_id(id ? (uint16_t)id : HID_REPORT_ID_UNDEFINED, type, hid_descriptor, hid_descriptor_len);
+    if (expected <= 0 || length < expected + (id != 0)) return false;
+    btstack_hid_parser_t parser;
+    btstack_hid_parser_init(&parser, hid_descriptor, hid_descriptor_len, type, report, length);
+    bool found = false;
+    while (btstack_hid_parser_has_more(&parser)) {
+        uint16_t page, usage;
+        int32_t value;
+        int32_t minimum = parser.usage_iterator.global_logical_minimum;
+        int32_t maximum = parser.usage_iterator.global_logical_maximum;
+        btstack_hid_parser_get_field(&parser, &page, &usage, &value);
+        if (page != HID_USAGE_PAGE_GENERIC_DEVICE || usage != HID_USAGE_BATTERY_STRENGTH || maximum <= minimum) continue;
+        int64_t percent = ((int64_t)value - minimum) * 100 / ((int64_t)maximum - minimum);
+        if (percent < 0) percent = 0;
+        if (percent > 100) percent = 100;
+        bb_state_update_battery(true, (uint8_t)percent, percent == 100 ? 3 : 1);
+        found = true;
+    }
+    return found;
+}
+
+static void record_input_report(const uint8_t* report, uint16_t length) {
+    diagnostic_report_original_length = length;
+    diagnostic_report_length = length < sizeof(diagnostic_report) ? length : sizeof(diagnostic_report);
+    memcpy(diagnostic_report, report, diagnostic_report_length);
+    ++diagnostic_report_sequence;
+}
+
 static bool parse_8bitdo_arcade(const uint8_t* report, uint16_t length) {
+
     if (report[0] == 0x30) return parse_switch_full(report, length);
     if (report[0] == 0x3f) return parse_switch_simple(report, length);
     if (report[0] == 0x21) return true;
+    int16_t battery_id = bb_driver_battery_report_id();
+    if (battery_id > 0 && bb_driver_battery_report_type() == HID_REPORT_TYPE_INPUT && report[0] == battery_id) {
+        btstack_hid_usage_iterator_t iterator;
+        btstack_hid_usage_iterator_init(&iterator, hid_descriptor, hid_descriptor_len, HID_REPORT_TYPE_INPUT);
+        bool battery_only = true;
+        while (btstack_hid_usage_iterator_has_more(&iterator)) {
+            btstack_hid_usage_item_t item;
+            btstack_hid_usage_iterator_get_item(&iterator, &item);
+            if (item.report_id == (uint16_t)battery_id &&
+                (item.usage_page != HID_USAGE_PAGE_GENERIC_DEVICE || item.usage != HID_USAGE_BATTERY_STRENGTH)) battery_only = false;
+        }
+        if (battery_only) return bb_driver_handle_battery_report(report, length);
+    }
     return parse_generic(report, length);
 }
 
@@ -929,6 +1086,14 @@ void bb_driver_reset(void) {
     memset(&identity, 0, sizeof(identity));
     hid_descriptor = NULL;
     hid_descriptor_len = 0;
+    diagnostic_report_length = 0;
+    diagnostic_report_original_length = 0;
+    diagnostic_report_sequence = 0;
+    diagnostic_battery_response_length = 0;
+    diagnostic_battery_status = -1;
+    diagnostic_battery_request_status = -1;
+    diagnostic_battery_request_count = 0;
+    have_early_arcade_battery_report = false;
     memset(&last_input_state, 0, sizeof(last_input_state));
     have_last_input_state = false;
     memset(eightbitdo_axis_roles, 0, sizeof(eightbitdo_axis_roles));
@@ -945,6 +1110,9 @@ void bb_driver_reset(void) {
 }
 
 void bb_driver_set_identity(const bb_controller_identity_t* value) {
+    bool preserve_battery = value && identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("arcade stick") &&
+        value->kind == BB_CONTROLLER_8BITDO && memcmp(identity.address, value->address, sizeof(identity.address)) == 0;
+    if (!preserve_battery) have_early_arcade_battery_report = false;
     if (value) identity = *value;
     else memset(&identity, 0, sizeof(identity));
     memset(eightbitdo_axis_roles, 0, sizeof(eightbitdo_axis_roles));
@@ -956,7 +1124,7 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
         n64_center[i] = 2048;
         n64_below[i] = n64_above[i] = 2047;
     }
-    bb_state_update_battery(false, 0, 0);
+    if (!preserve_battery) bb_state_update_battery(false, 0, 0);
     bool rumble = identity.kind == BB_CONTROLLER_DUALSENSE || identity.kind == BB_CONTROLLER_DUALSENSE_EDGE || identity.kind == BB_CONTROLLER_DUALSHOCK4 || identity.kind == BB_CONTROLLER_DUALSHOCK3 || identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_WII_U_PRO || identity.kind == BB_CONTROLLER_8BITDO;
     if (identity.kind == BB_CONTROLLER_8BITDO && (eightbitdo_name_has("arcade stick") || eightbitdo_name_has("m30"))) rumble = false;
     bb_state_set_rumble_supported(rumble);
@@ -965,6 +1133,9 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
 void bb_driver_set_hid_descriptor(const uint8_t* descriptor, uint16_t length) {
     hid_descriptor = descriptor;
     hid_descriptor_len = length;
+    if (have_early_arcade_battery_report && bb_driver_battery_report_id() == 4 && bb_driver_battery_report_type() == HID_REPORT_TYPE_INPUT) {
+        bb_driver_handle_battery_report(early_arcade_battery_report, sizeof(early_arcade_battery_report));
+    }
 }
 
 const bb_controller_identity_t* bb_driver_identity(void) {
@@ -1012,7 +1183,9 @@ bool bb_driver_refine_identity_from_hid_descriptor(const uint8_t* descriptor, ui
 
 bool bb_driver_handle_xbox_ble_report(const uint8_t* report, uint16_t length) {
     if (identity.kind != BB_CONTROLLER_XBOX_SERIES && identity.kind != BB_CONTROLLER_XBOX_ONE) return false;
-    if (!report || length != 17 || report[0] != 1) return false;
+    if (!report || !length) return false;
+    if (length != 17 || report[0] != 1) return false;
+    record_input_report(report, length);
     bb_input_state_t state;
     bb_input_clear(&state);
     int16_t* axes[4] = {&state.x, &state.y, &state.rx, &state.ry};
@@ -1053,6 +1226,11 @@ bool bb_driver_handle_xbox_ble_report(const uint8_t* report, uint16_t length) {
 
 bool bb_driver_handle_hid_report(const uint8_t* report, uint16_t length) {
     if (!report || !length) return false;
+    record_input_report(report, length);
+    if (identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("arcade stick") && length == 2 && report[0] == 4) {
+        memcpy(early_arcade_battery_report, report, sizeof(early_arcade_battery_report));
+        have_early_arcade_battery_report = true;
+    }
     uint8_t id = report[0];
     if (identity.kind == BB_CONTROLLER_DUALSENSE || identity.kind == BB_CONTROLLER_DUALSENSE_EDGE) {
         if (id == 0x31) return parse_dualsense_bt_full(report, length);
@@ -1074,7 +1252,8 @@ bool bb_driver_handle_hid_report(const uint8_t* report, uint16_t length) {
     }
     if (identity.kind == BB_CONTROLLER_NSO_N64) {
         if (id == 0x30) return parse_n64_full(report, length);
-        return id == 0x21 || id == 0x3f;
+        if (id == 0x3f) return parse_n64_simple(report, length);
+        return id == 0x21;
     }
     if (identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("arcade stick")) return parse_8bitdo_arcade(report, length);
     if (identity.kind == BB_CONTROLLER_8BITDO && parse_8bitdo_enhanced(report, length)) return true;
@@ -1198,5 +1377,46 @@ bool bb_driver_handle_nintendo_ble_report(const uint8_t* report, uint16_t length
         bb_state_update_button_capabilities(0x000072ffu);
     }
     submit_state(&s);
+    return true;
+}
+
+void bb_driver_record_battery_request(uint8_t status) {
+    diagnostic_battery_request_status = status;
+    ++diagnostic_battery_request_count;
+}
+
+void bb_driver_record_battery_response(uint8_t status, const uint8_t* report, uint16_t length) {
+    diagnostic_battery_status = status;
+    diagnostic_battery_response_length = report ? (length < sizeof(diagnostic_battery_response) ? length : sizeof(diagnostic_battery_response)) : 0;
+    if (diagnostic_battery_response_length) memcpy(diagnostic_battery_response, report, diagnostic_battery_response_length);
+}
+
+bool bb_driver_hid_diagnostics(uint16_t offset, char* out, size_t size) {
+    if (!out || size < 1024 || offset > hid_descriptor_len) return false;
+    char descriptor_hex[257];
+    char report_hex[129];
+    char battery_hex[65];
+    uint16_t count = hid_descriptor_len - offset;
+    if (count > 128) count = 128;
+    static const char digits[] = "0123456789abcdef";
+    for (uint16_t i = 0; i < count; ++i) {
+        uint8_t value = hid_descriptor[offset + i];
+        descriptor_hex[2 * i] = digits[value >> 4];
+        descriptor_hex[2 * i + 1] = digits[value & 15];
+    }
+    descriptor_hex[2 * count] = 0;
+    for (uint16_t i = 0; i < diagnostic_report_length; ++i) {
+        uint8_t value = diagnostic_report[i];
+        report_hex[2 * i] = digits[value >> 4];
+        report_hex[2 * i + 1] = digits[value & 15];
+    }
+    report_hex[2 * diagnostic_report_length] = 0;
+    for (uint8_t i = 0; i < diagnostic_battery_response_length; ++i) {
+        uint8_t value = diagnostic_battery_response[i];
+        battery_hex[2 * i] = digits[value >> 4];
+        battery_hex[2 * i + 1] = digits[value & 15];
+    }
+    battery_hex[2 * diagnostic_battery_response_length] = 0;
+    snprintf(out, size, "{\"vid\":%u,\"pid\":%u,\"kind\":%u,\"descriptor_length\":%u,\"offset\":%u,\"descriptor_hex\":\"%s\",\"report_hex\":\"%s\",\"report_length\":%u,\"report_sequence\":%lu,\"battery_report_id\":%d,\"battery_report_type\":%u,\"battery_response_status\":%d,\"battery_response_hex\":\"%s\",\"battery_request_status\":%d,\"battery_request_count\":%lu}", identity.vendor_id, identity.product_id, (unsigned)identity.kind, hid_descriptor_len, offset, descriptor_hex, report_hex, diagnostic_report_original_length, (unsigned long)diagnostic_report_sequence, bb_driver_battery_report_id(), bb_driver_battery_report_type(), diagnostic_battery_status, battery_hex, diagnostic_battery_request_status, (unsigned long)diagnostic_battery_request_count);
     return true;
 }

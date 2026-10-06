@@ -269,7 +269,25 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     else if (kind == BB_CONTROLLER_NSO_SNES) labels = snes;
     else if (kind == BB_CONTROLLER_NSO_NES) labels = nes;
     else if (kind == BB_CONTROLLER_NSO_GENESIS) labels = genesis;
-    else if (kind == BB_CONTROLLER_8BITDO) labels = eightbitdo;
+    else if (kind == BB_CONTROLLER_8BITDO) {
+        labels = eightbitdo;
+        if (contains_ci(name, "m30")) {
+            if (index == 4) return "Z";
+            if (index == 5) return "C";
+            if (index == 6) return "L";
+            if (index == 7) return "R";
+        }
+        if (contains_ci(name, "arcade stick") && contains_ci(name, "x mode")) {
+            if (index == 4) return "LB";
+            if (index == 5) return "RB";
+            if (index == 6) return "LT";
+            if (index == 7) return "RT";
+        }
+        if (contains_ci(name, "arcade stick") && contains_ci(name, "s mode")) {
+            if (index == 8) return "Minus";
+            if (index == 9) return "Plus";
+        }
+    }
     else if (kind == BB_CONTROLLER_STEAM2) labels = steam2;
     else if (kind == BB_CONTROLLER_SWITCH2_PRO) labels = switch2;
     else if (kind == BB_CONTROLLER_SWITCH_PRO || kind == BB_CONTROLLER_JOYCON_LEFT || kind == BB_CONTROLLER_JOYCON_RIGHT || kind == BB_CONTROLLER_NSO_GAMECUBE || kind == BB_CONTROLLER_WII_U_PRO) labels = nintendo;
@@ -344,10 +362,11 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
             if (contains_ci(name, "pro 3")) c.buttons = 0x000f1fffu;
             else if (contains_ci(name, "ultimate") || contains_ci(name, "pro 2")) c.buttons = 0x00033fffu;
             else if (contains_ci(name, "arcade stick")) {
-                c.buttons = 0x000033ffu;
+                c.buttons = 0x000013ffu;
                 c.left_trigger = c.right_trigger = 0;
             }
             else if (contains_ci(name, "m30")) {
+                c.buttons = 0x000013ffu;
                 c.left_stick = c.right_stick = 0;
                 c.left_trigger = c.right_trigger = 0;
             }
@@ -425,7 +444,11 @@ void bb_controller_display_name(bb_controller_kind_t kind, const char* raw_name,
     if (!out || !out_size) return;
     const char* value = bb_controller_kind_name(kind);
     if (kind == BB_CONTROLLER_8BITDO) {
-        if (contains_ci(raw_name, "arcade stick") || contains_ci(raw_name, "nes30 arcade")) value = "8BitDo Arcade Stick";
+        if (contains_ci(raw_name, "arcade stick") || contains_ci(raw_name, "nes30 arcade")) {
+            if (contains_ci(raw_name, "s mode")) value = "8BitDo Arcade Stick - S Mode";
+            else if (contains_ci(raw_name, "x mode")) value = "8BitDo Arcade Stick - X Mode";
+            else value = "8BitDo Arcade Stick";
+        }
         else if (contains_ci(raw_name, "pro 3")) value = "8BitDo Pro 3";
         else if (contains_ci(raw_name, "pro 2")) value = "8BitDo Pro 2";
         else if (contains_ci(raw_name, "ultimate")) value = "8BitDo Ultimate Controller";
