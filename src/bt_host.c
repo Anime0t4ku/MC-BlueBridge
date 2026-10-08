@@ -62,7 +62,7 @@ static const char* ble_stage = "idle";
 static const char* ble_failed_stage = "none";
 static int16_t ble_setup_status = -1;
 static int16_t ble_pairing_reason = -1;
-static uint8_t ble_key_minimum = 16;
+static uint8_t ble_key_minimum = 7;
 static uint8_t ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION;
 static char ble_peer_name[32];
 static uint32_t ble_attempt_count;
@@ -667,6 +667,7 @@ static void refresh_classic_identity(const char* name, uint16_t vid, uint16_t pi
     if (vid) updated.vendor_id = vid;
     if (pid) updated.product_id = pid;
     const char* resolved = name && name[0] ? name : current_identity.name;
+    if (updated.vendor_id == 0x2dc8 && updated.product_id == 0x9020) resolved = "8BitDo Micro";
     if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "arcade stick") && name_has(resolved, "pro controller")) resolved = current_identity.name;
     bb_controller_kind_t kind = bb_controller_identify(updated.vendor_id, updated.product_id, resolved);
     if (kind != BB_CONTROLLER_GENERIC) updated.kind = kind;
@@ -799,7 +800,7 @@ static void controller_disconnected(void) {
     classic_attempt_active = false;
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
     ble_connecting = false;
-    sm_set_encryption_key_size_range(16, 16);
+    sm_set_encryption_key_size_range(7, 16);
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
     ble_setup_started = false;
     if (!strcmp(ble_failed_stage, "none")) ble_stage = "disconnected";
@@ -886,7 +887,7 @@ static bool ble_is_8bitdo64(const char* name) {
 }
 
 static void configure_ble_security(void) {
-    ble_key_minimum = 16;
+    ble_key_minimum = 7;
     ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION;
     sm_set_authentication_requirements(ble_authentication);
     sm_set_encryption_key_size_range(ble_key_minimum, 16);
@@ -916,7 +917,7 @@ static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const c
     le_gamecube = gamecube;
     uint8_t status = gap_connect(pending_addr, pending_addr_type);
     if (status != ERROR_CODE_SUCCESS) {
-        sm_set_encryption_key_size_range(16, 16);
+        sm_set_encryption_key_size_range(7, 16);
         sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
         ble_connecting = false;
         le_custom_nintendo = false;
@@ -1217,7 +1218,8 @@ static void classic_hid_event(uint8_t* packet) {
                 const uint8_t* descriptor = hid_descriptor_storage_get_descriptor_data(classic_hid_cid);
                 uint16_t descriptor_len = hid_descriptor_storage_get_descriptor_len(classic_hid_cid);
                 bb_driver_set_hid_descriptor(descriptor, descriptor_len);
-                if (current_identity.kind == BB_CONTROLLER_GENERIC || current_identity.kind == BB_CONTROLLER_SWITCH_PRO) identity_query_pending = true;
+                if (current_identity.kind == BB_CONTROLLER_GENERIC || current_identity.kind == BB_CONTROLLER_SWITCH_PRO ||
+                    (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "8bitdo controller"))) identity_query_pending = true;
                 bb_controller_identity_t refined = current_identity;
                 if (bb_driver_refine_identity_from_hid_descriptor(descriptor, descriptor_len, &refined)) {
                     current_identity = refined;
@@ -1419,7 +1421,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, 
             if (hci_event_gap_meta_get_subevent_code(packet) == GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
                 if (gap_subevent_le_connection_complete_get_status(packet) != ERROR_CODE_SUCCESS) {
                     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
-                    sm_set_encryption_key_size_range(16, 16);
+                    sm_set_encryption_key_size_range(7, 16);
                     ble_setup_status = gap_subevent_le_connection_complete_get_status(packet);
                     ble_failed_stage = "connecting";
                     ble_stage = "failed";
@@ -1558,7 +1560,7 @@ void bb_bt_host_init(void) {
     sm_init();
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
-    sm_set_encryption_key_size_range(16, 16);
+    sm_set_encryption_key_size_range(7, 16);
     gatt_client_init();
     device_information_service_client_init();
     battery_service_client_init();

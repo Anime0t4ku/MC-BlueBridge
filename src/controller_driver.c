@@ -264,6 +264,12 @@ static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabili
         map_8bitdo_layout(state, capabilities, xinput, sizeof(xinput));
         return;
     }
+    if (eightbitdo_name_has("micro")) {
+        static const uint8_t layout[] = {1,0,255,3,2,255,4,5,6,7,8,9,12};
+        map_8bitdo_layout(state, capabilities, layout, sizeof(layout));
+        state->lt = state->rt = 0;
+        return;
+    }
     if (eightbitdo_name_has("m30")) {
         static const uint8_t layout[] = {1,0,12,3,2,255,4,5,6,7,8,9,12};
         map_8bitdo_layout(state, capabilities, layout, sizeof(layout));
@@ -892,7 +898,8 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
     uint32_t button_capabilities = 0;
     bool arcade = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("arcade stick");
     bool m30 = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("m30");
-    if (arcade || m30) {
+    bool micro = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("micro");
+    if (arcade || m30 || micro) {
         bool numbered = btstack_hid_report_id_declared(hid_descriptor, hid_descriptor_len);
         int expected = btstack_hid_get_report_size_for_id(numbered ? report[0] : HID_REPORT_ID_UNDEFINED, HID_REPORT_TYPE_INPUT, hid_descriptor, hid_descriptor_len);
         if (expected <= 0 || length < expected + numbered) return false;
@@ -961,14 +968,14 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             case HID_USAGE_Z: s.lt = generic_trigger(value, minimum, maximum); analog_lt = true; break;
             case HID_USAGE_RZ: s.rt = generic_trigger(value, minimum, maximum); analog_rt = true; break;
             case HID_USAGE_HAT:
-                if (arcade || m30) s.dpad = value >= minimum && value <= maximum ? hat_to_dpad(value - minimum) : 0;
+                if (arcade || m30 || micro) s.dpad = value >= minimum && value <= maximum ? hat_to_dpad(value - minimum) : 0;
                 else s.dpad = hat_to_dpad(value);
                 break;
             default: break;
         }
     }
     if (identity.kind == BB_CONTROLLER_8BITDO) {
-        if (m30) {
+        if (m30 || micro) {
             const uint8_t pairs[][2] = {{0,1},{2,5},{3,4}};
             for (uint8_t pair = 0; pair < 3; ++pair) {
                 uint8_t x = pairs[pair][0];
@@ -1126,7 +1133,7 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
     }
     if (!preserve_battery) bb_state_update_battery(false, 0, 0);
     bool rumble = identity.kind == BB_CONTROLLER_DUALSENSE || identity.kind == BB_CONTROLLER_DUALSENSE_EDGE || identity.kind == BB_CONTROLLER_DUALSHOCK4 || identity.kind == BB_CONTROLLER_DUALSHOCK3 || identity.kind == BB_CONTROLLER_SWITCH_PRO || identity.kind == BB_CONTROLLER_JOYCON_LEFT || identity.kind == BB_CONTROLLER_JOYCON_RIGHT || identity.kind == BB_CONTROLLER_WII_U_PRO || identity.kind == BB_CONTROLLER_8BITDO;
-    if (identity.kind == BB_CONTROLLER_8BITDO && (eightbitdo_name_has("arcade stick") || eightbitdo_name_has("m30"))) rumble = false;
+    if (identity.kind == BB_CONTROLLER_8BITDO && (eightbitdo_name_has("arcade stick") || eightbitdo_name_has("m30") || eightbitdo_name_has("micro"))) rumble = false;
     bb_state_set_rumble_supported(rumble);
 }
 

@@ -365,6 +365,11 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
                 c.buttons = 0x000013ffu;
                 c.left_trigger = c.right_trigger = 0;
             }
+            else if (contains_ci(name, "micro")) {
+                c.buttons = 0x000013ffu;
+                c.left_stick = c.right_stick = 0;
+                c.left_trigger = c.right_trigger = 0;
+            }
             else if (contains_ci(name, "m30")) {
                 c.buttons = 0x000013ffu;
                 c.left_stick = c.right_stick = 0;
@@ -449,6 +454,7 @@ void bb_controller_display_name(bb_controller_kind_t kind, const char* raw_name,
             else if (contains_ci(raw_name, "x mode")) value = "8BitDo Arcade Stick - X Mode";
             else value = "8BitDo Arcade Stick";
         }
+        else if (contains_ci(raw_name, "micro")) value = "8BitDo Micro";
         else if (contains_ci(raw_name, "pro 3")) value = "8BitDo Pro 3";
         else if (contains_ci(raw_name, "pro 2")) value = "8BitDo Pro 2";
         else if (contains_ci(raw_name, "ultimate")) value = "8BitDo Ultimate Controller";
