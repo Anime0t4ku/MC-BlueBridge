@@ -457,6 +457,7 @@ void bb_controller_display_name(bb_controller_kind_t kind, const char* raw_name,
         else if (contains_ci(raw_name, "micro")) value = "8BitDo Micro";
         else if (contains_ci(raw_name, "pro 3")) value = "8BitDo Pro 3";
         else if (contains_ci(raw_name, "pro 2")) value = "8BitDo Pro 2";
+        else if (contains_ci(raw_name, "ultimate 2c wireless")) value = "8BitDo Ultimate 2C Wireless";
         else if (contains_ci(raw_name, "ultimate")) value = "8BitDo Ultimate Controller";
         else if (contains_ci(raw_name, "sn30")) value = "8BitDo SN30 Controller";
         else if (contains_ci(raw_name, "m30")) value = "8BitDo M30 Controller";

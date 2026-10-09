@@ -41,6 +41,7 @@ static bool eightbitdo_axis_roles_ready;
 static uint32_t switch2_cal_sum[4];
 static uint16_t switch2_cal_center[4];
 static uint8_t switch2_cal_samples;
+static uint8_t gamecube_trigger_rest[2] = {255, 255};
 static uint16_t n64_center[2] = {2048, 2048};
 static uint16_t n64_below[2] = {2047, 2047};
 static uint16_t n64_above[2] = {2047, 2047};
@@ -1108,6 +1109,7 @@ void bb_driver_reset(void) {
     memset(switch2_cal_sum, 0, sizeof(switch2_cal_sum));
     memset(switch2_cal_center, 0, sizeof(switch2_cal_center));
     switch2_cal_samples = 0;
+    gamecube_trigger_rest[0] = gamecube_trigger_rest[1] = 255;
     for (unsigned i = 0; i < 2; ++i) {
         n64_center[i] = 2048;
         n64_below[i] = n64_above[i] = 2047;
@@ -1127,6 +1129,7 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
     memset(switch2_cal_sum, 0, sizeof(switch2_cal_sum));
     memset(switch2_cal_center, 0, sizeof(switch2_cal_center));
     switch2_cal_samples = 0;
+    gamecube_trigger_rest[0] = gamecube_trigger_rest[1] = 255;
     for (unsigned i = 0; i < 2; ++i) {
         n64_center[i] = 2048;
         n64_below[i] = n64_above[i] = 2047;
@@ -1276,6 +1279,14 @@ bool bb_driver_handle_hid_report(const uint8_t* report, uint16_t length) {
     return parse_generic(report, length);
 }
 
+static uint16_t gamecube_trigger_value(uint8_t value, uint8_t index, bool clicked) {
+    if (!clicked && value < gamecube_trigger_rest[index]) gamecube_trigger_rest[index] = value;
+    if (clicked) return 255;
+    uint16_t floor = (uint16_t)gamecube_trigger_rest[index] + 3u;
+    if (value <= floor || floor >= 255u) return 0;
+    return (uint16_t)(((uint32_t)(value - floor) * 255u) / (255u - floor));
+}
+
 bool bb_driver_handle_nintendo_ble_report(const uint8_t* report, uint16_t length, bool gamecube, bool switch2_pro) {
     if (!report || length < 14) return false;
     bb_input_state_t s;
@@ -1340,10 +1351,17 @@ bool bb_driver_handle_nintendo_ble_report(const uint8_t* report, uint16_t length
     uint8_t a = report[2];
     uint8_t b = report[3];
     uint8_t c = report[4];
-    if (a & 0x02) s.buttons |= 1u << 0;
-    if (a & 0x01) s.buttons |= 1u << 1;
-    if (a & 0x08) s.buttons |= 1u << 2;
-    if (a & 0x04) s.buttons |= 1u << 3;
+    if (gamecube) {
+        if (a & 0x01) s.buttons |= 1u << 0;
+        if (a & 0x02) s.buttons |= 1u << 1;
+        if (a & 0x04) s.buttons |= 1u << 2;
+        if (a & 0x08) s.buttons |= 1u << 3;
+    } else {
+        if (a & 0x02) s.buttons |= 1u << 0;
+        if (a & 0x01) s.buttons |= 1u << 1;
+        if (a & 0x08) s.buttons |= 1u << 2;
+        if (a & 0x04) s.buttons |= 1u << 3;
+    }
     if (gamecube) {
         if (b & 0x20) s.buttons |= 1u << 4;
         if (a & 0x20) s.buttons |= 1u << 5;
@@ -1373,8 +1391,8 @@ bool bb_driver_handle_nintendo_ble_report(const uint8_t* report, uint16_t length
     s.rx = axis12(unpack12a(&report[8]));
     s.ry = (int16_t)-axis12(unpack12b(&report[8]));
     if (gamecube) {
-        s.lt = report[12];
-        s.rt = report[13];
+        s.lt = gamecube_trigger_value(report[12], 0, (b & 0x20) != 0);
+        s.rt = gamecube_trigger_value(report[13], 1, (a & 0x20) != 0);
     } else {
         s.lt = (b & 0x20) ? 255 : 0;
         s.rt = (a & 0x20) ? 255 : 0;

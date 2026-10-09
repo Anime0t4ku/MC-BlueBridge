@@ -8,6 +8,8 @@
 #include "ble/gatt-service/hids_host.h"
 #include "ble/gatt-service/device_information_service_client.h"
 #include "ble/gatt-service/battery_service_client.h"
+#include "ble/att_db_util.h"
+#include "ble/att_server.h"
 #include "ble/le_device_db.h"
 #include "ble/le_device_db_tlv.h"
 #include "classic/btstack_link_key_db_tlv.h"
@@ -28,6 +30,11 @@ static btstack_packet_callback_registration_t sm_callback;
 static uint8_t hids_descriptor_storage[BB_HID_DESCRIPTOR_STORAGE];
 static uint8_t classic_hid_storage[BB_CLASSIC_HID_STORAGE];
 static uint8_t host_device_id_record[128];
+static uint16_t host_service_changed_ccc_handle;
+static uint16_t host_service_changed_ccc;
+static uint8_t host_att_name[] = "MC BlueBridge";
+static uint8_t host_att_appearance[] = {0x80, 0x00};
+static uint8_t host_service_changed_range[] = {0x01, 0x00, 0xff, 0xff};
 static uint32_t classic_attempt_started;
 static bool classic_attempt_active;
 static hci_con_handle_t pending_classic_handle = HCI_CON_HANDLE_INVALID;
@@ -58,6 +65,8 @@ static bool ble_connecting;
 static uint32_t ble_attempt_started;
 static bool ble_setup_started;
 static bool ble_bond_retry;
+static uint8_t ultimate2c_setup_step;
+static uint32_t ultimate2c_setup_at;
 static const char* ble_stage = "idle";
 static const char* ble_failed_stage = "none";
 static int16_t ble_setup_status = -1;
@@ -91,6 +100,12 @@ static uint8_t xbox_rumble_payload[8];
 static bool xbox_rumble_write_pending;
 static bool xbox_rumble_retry;
 static uint8_t dualsense_output_seq;
+static uint8_t ds4_output_report[78];
+static bool ds4_descriptor_ready;
+static bool ds4_activation_pending;
+static uint32_t ds4_activation_at;
+static uint8_t ds4_activation_attempts;
+static uint8_t ds4_activation_step;
 static uint8_t switch_output_seq;
 static bool classic_switch_setup_sent;
 static bool classic_switch_protocol;
@@ -197,11 +212,11 @@ static bool send_switch_report_mode(uint8_t mode) {
 }
 
 static bool send_ds4_rumble(uint8_t strength) {
-    if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK4) return false;
-    uint8_t report[78];
-    memset(report, 0, sizeof(report));
+    if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK4 || ds4_activation_step == 2) return false;
+    uint8_t* report = ds4_output_report;
+    memset(report, 0, sizeof(ds4_output_report));
     report[0] = 0x11;
-    report[1] = 0xc0;
+    report[1] = 0xc4;
     report[3] = 0x07;
     report[6] = strength;
     report[7] = strength;
@@ -746,6 +761,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
         current_identity.kind = BB_CONTROLLER_8BITDO;
         identity_name = stored_name;
     }
+    if (vid == 0x2dc8 && pid == 0x301b) identity_name = "8BitDo Ultimate 2C Wireless";
     bb_controller_display_name(current_identity.kind, identity_name, current_identity.name, sizeof(current_identity.name));
     uint8_t controller_index = 0;
     if (!bb_controller_activate_or_create(addr, vid, pid, current_identity.name, &controller_index)) return;
@@ -756,7 +772,13 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
         switch_setup_begin();
     }
     if (current_identity.kind == BB_CONTROLLER_DUALSHOCK3) { send_ds3_activation(); send_ds3_rumble(0); }
-    if (current_identity.kind == BB_CONTROLLER_DUALSHOCK4) send_ds4_rumble(0);
+    ds4_descriptor_ready = false;
+    if (current_identity.kind == BB_CONTROLLER_DUALSHOCK4) {
+        ds4_activation_pending = true;
+        ds4_activation_attempts = 0;
+        ds4_activation_step = 0;
+        ds4_activation_at = btstack_run_loop_get_time_ms() + 100u;
+    }
     if (current_identity.kind == BB_CONTROLLER_WII_U_PRO) {
         wiiu_setup_step = 1;
         wiiu_setup_at = btstack_run_loop_get_time_ms();
@@ -783,6 +805,9 @@ static void controller_disconnected(void) {
     xbox_battery_cid = 0;
     if (battery_cid) battery_service_client_disconnect(battery_cid);
     classic_generation++;
+    ds4_descriptor_ready = false;
+    ds4_activation_pending = false;
+    ds4_activation_step = 0;
     arcade_battery_poll_at = 0;
     identity_query_pending = false;
     connected_name_request = false;
@@ -800,6 +825,8 @@ static void controller_disconnected(void) {
     classic_attempt_active = false;
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
     ble_connecting = false;
+    ultimate2c_setup_step = 0;
+    host_service_changed_ccc = 0;
     sm_set_encryption_key_size_range(7, 16);
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
     ble_setup_started = false;
@@ -981,6 +1008,11 @@ static void xbox_battery_handler(uint8_t packet_type, uint16_t channel, uint8_t*
     }
 }
 
+static bool ble_is_ultimate2c(void) {
+    return (pending_vid == 0x2dc8 && pending_pid == 0x301b) || name_has(pending_name, "ultimate 2c wireless");
+}
+
+static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void ble_setup_fail(uint8_t status);
 
 static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
@@ -993,12 +1025,27 @@ static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet,
                 ble_setup_fail(gattservice_subevent_hid_service_connected_get_status(packet));
                 return;
             }
+            if (ble_is_ultimate2c()) {
+                ultimate2c_setup_step = 1;
+                ultimate2c_setup_at = btstack_run_loop_get_time_ms();
+                ble_stage = "report_mode";
+                break;
+            }
             activate_controller(pending_addr, pending_addr_type, pending_vid, pending_pid, pending_name);
             xbox_rumble_write_pending = false;
             xbox_rumble_retry = false;
             if (xbox_ble_connected()) {
                 bb_state_set_rumble_supported(true);
                 if (!xbox_battery_cid && battery_service_client_connect(le_handle, xbox_battery_handler, 60000, &xbox_battery_cid) != ERROR_CODE_SUCCESS) xbox_battery_cid = 0;
+            }
+            break;
+        case GATTSERVICE_SUBEVENT_HID_SERVICE_REPORTS_NOTIFICATION:
+            if (ultimate2c_setup_step == 3 &&
+                gattservice_subevent_hid_service_reports_notification_get_hids_cid(packet) == hids_cid &&
+                gattservice_subevent_hid_service_reports_notification_get_configuration(packet) == 1) {
+                ultimate2c_setup_step = 4;
+                ultimate2c_setup_at = btstack_run_loop_get_time_ms();
+                ble_stage = "device_information";
             }
             break;
         case GATTSERVICE_SUBEVENT_HID_REPORT: {
@@ -1051,7 +1098,12 @@ static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t*
             break;
         case GATTSERVICE_SUBEVENT_DEVICE_INFORMATION_DONE:
             if (gattservice_subevent_device_information_done_get_con_handle(packet) == le_handle && le_handle != HCI_CON_HANDLE_INVALID) {
-                ble_start_hid();
+                if (ble_is_ultimate2c() && hids_cid) {
+                    if (ultimate2c_setup_step == 5) {
+                        ultimate2c_setup_step = 0;
+                        activate_controller(pending_addr, pending_addr_type, pending_vid, pending_pid, pending_name);
+                    }
+                } else ble_start_hid();
             }
             break;
         default:
@@ -1104,6 +1156,8 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
     ble_setup_started = true;
     if (le_custom_nintendo) {
         enable_nintendo_notifications();
+    } else if (ble_is_ultimate2c()) {
+        ble_start_hid();
     } else {
         ble_stage = "device_information";
         if (device_information_service_client_query(le_handle, ble_identity_handler) != ERROR_CODE_SUCCESS) ble_start_hid();
@@ -1218,6 +1272,7 @@ static void classic_hid_event(uint8_t* packet) {
                 const uint8_t* descriptor = hid_descriptor_storage_get_descriptor_data(classic_hid_cid);
                 uint16_t descriptor_len = hid_descriptor_storage_get_descriptor_len(classic_hid_cid);
                 bb_driver_set_hid_descriptor(descriptor, descriptor_len);
+                ds4_descriptor_ready = true;
                 if (current_identity.kind == BB_CONTROLLER_GENERIC || current_identity.kind == BB_CONTROLLER_SWITCH_PRO ||
                     (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "8bitdo controller"))) identity_query_pending = true;
                 bb_controller_identity_t refined = current_identity;
@@ -1228,7 +1283,12 @@ static void classic_hid_event(uint8_t* packet) {
                         bb_controller_update_identity((uint8_t)current_controller_index, current_identity.vendor_id, current_identity.product_id, current_identity.name);
                         bb_state_set_controller(true, current_controller_index, current_identity.name);
                     }
-                    if (current_identity.kind == BB_CONTROLLER_DUALSHOCK4) send_ds4_rumble(0);
+                    if (current_identity.kind == BB_CONTROLLER_DUALSHOCK4) {
+                        ds4_activation_pending = true;
+                        ds4_activation_attempts = 0;
+                        ds4_activation_step = 0;
+                        ds4_activation_at = btstack_run_loop_get_time_ms() + 100u;
+                    }
                 }
                 if (current_identity.kind == BB_CONTROLLER_DUALSHOCK3) send_ds3_activation();
                 if (current_identity.kind == BB_CONTROLLER_DUALSENSE || current_identity.kind == BB_CONTROLLER_DUALSENSE_EDGE) hid_host_send_get_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x05);
@@ -1236,6 +1296,12 @@ static void classic_hid_event(uint8_t* packet) {
             }
             break;
         case HID_SUBEVENT_GET_REPORT_RESPONSE: {
+            if (hid_subevent_get_report_response_get_hid_cid(packet) == classic_hid_cid &&
+                current_identity.kind == BB_CONTROLLER_DUALSHOCK4 && ds4_activation_step == 2) {
+                ds4_activation_step = 3;
+                ds4_activation_pending = false;
+                break;
+            }
             if (hid_subevent_get_report_response_get_hid_cid(packet) != classic_hid_cid ||
                 current_identity.kind != BB_CONTROLLER_8BITDO || !name_has(current_identity.name, "arcade stick")) break;
             uint8_t status = hid_subevent_get_report_response_get_handshake_status(packet);
@@ -1479,6 +1545,46 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
             usb_lost_since = 0;
         }
     }
+    if (ultimate2c_setup_step && le_handle != HCI_CON_HANDLE_INVALID && ble_connecting) {
+        if ((uint32_t)(now - ultimate2c_setup_at) >= 6000u) {
+            bool hid_ready = ultimate2c_setup_step >= 4;
+            ultimate2c_setup_step = 0;
+            if (hid_ready) activate_controller(pending_addr, pending_addr_type, pending_vid, pending_pid, pending_name);
+            else ble_setup_fail(ERROR_CODE_CONNECTION_TIMEOUT);
+        } else if (ultimate2c_setup_step == 1) {
+            uint8_t status = hids_host_send_set_protocol_mode(hids_cid, 0, HID_PROTOCOL_MODE_REPORT);
+            if (status == ERROR_CODE_SUCCESS || status == ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE) {
+                ultimate2c_setup_step = 2;
+                ultimate2c_setup_at = now;
+            }
+        } else if (ultimate2c_setup_step == 2 && (uint32_t)(now - ultimate2c_setup_at) >= 300u) {
+            ultimate2c_setup_step = 3;
+            if (hids_host_enable_notifications(hids_cid) != ERROR_CODE_SUCCESS) ultimate2c_setup_step = 2;
+            else ble_stage = "notifications";
+        } else if (ultimate2c_setup_step == 4) {
+            ultimate2c_setup_step = 5;
+            if (device_information_service_client_query(le_handle, ble_identity_handler) != ERROR_CODE_SUCCESS) ultimate2c_setup_step = 4;
+        }
+    }
+    if (ds4_activation_pending && ds4_descriptor_ready && classic_hid_cid &&
+        current_identity.kind == BB_CONTROLLER_DUALSHOCK4 && !manual_disconnect_pending &&
+        (int32_t)(now - ds4_activation_at) >= 0) {
+        if (ds4_activation_attempts < 10) {
+            ++ds4_activation_attempts;
+            if (ds4_activation_step == 0) {
+                if (send_ds4_rumble(0)) {
+                    ds4_activation_step = 1;
+                    ds4_activation_attempts = 0;
+                }
+            } else if (ds4_activation_step == 1) {
+                ds4_activation_step = 2;
+                if (hid_host_send_get_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x05) == ERROR_CODE_SUCCESS) {
+                    ds4_activation_pending = false;
+                } else ds4_activation_step = 1;
+            }
+            ds4_activation_at = now + 100u;
+        } else ds4_activation_pending = false;
+    }
     if (wiiu_setup_step && classic_hid_cid && current_identity.kind == BB_CONTROLLER_WII_U_PRO && (int32_t)(now - wiiu_setup_at) >= 0) {
         bool sent = false;
         if (wiiu_setup_step == 1) sent = send_wiiu_write(0xa400f0u, 0x55);
@@ -1543,6 +1649,37 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
     btstack_run_loop_add_timer(timer);
 }
 
+static uint16_t host_att_read(hci_con_handle_t handle, uint16_t attribute, uint16_t offset, uint8_t* buffer, uint16_t size) {
+    (void)handle;
+    if (attribute != host_service_changed_ccc_handle) return 0;
+    uint8_t value[2] = {(uint8_t)host_service_changed_ccc, (uint8_t)(host_service_changed_ccc >> 8)};
+    return att_read_callback_handle_blob(value, sizeof(value), offset, buffer, size);
+}
+
+static int host_att_write(hci_con_handle_t handle, uint16_t attribute, uint16_t transaction, uint16_t offset, uint8_t* buffer, uint16_t size) {
+    (void)handle;
+    if (attribute != host_service_changed_ccc_handle) return ATT_ERROR_WRITE_NOT_PERMITTED;
+    if (transaction != ATT_TRANSACTION_MODE_NONE) return ATT_ERROR_REQUEST_NOT_SUPPORTED;
+    if (offset) return ATT_ERROR_INVALID_OFFSET;
+    if (size != 2) return ATT_ERROR_INVALID_ATTRIBUTE_VALUE_LENGTH;
+    uint16_t value = little_endian_read_16(buffer, 0);
+    if (value != 0 && value != 2) return ATT_ERROR_VALUE_NOT_ALLOWED;
+    host_service_changed_ccc = value;
+    return ATT_ERROR_SUCCESS;
+}
+
+static void setup_host_att_server(void) {
+    att_db_util_init();
+    att_db_util_add_service_uuid16(0x1800);
+    att_db_util_add_characteristic_uuid16(0x2a00, ATT_PROPERTY_READ, ATT_SECURITY_NONE, ATT_SECURITY_NONE, host_att_name, sizeof(host_att_name) - 1);
+    att_db_util_add_characteristic_uuid16(0x2a01, ATT_PROPERTY_READ, ATT_SECURITY_NONE, ATT_SECURITY_NONE, host_att_appearance, sizeof(host_att_appearance));
+    att_db_util_add_service_uuid16(0x1801);
+    uint16_t value_handle = att_db_util_add_characteristic_uuid16(0x2a05, ATT_PROPERTY_INDICATE, ATT_SECURITY_NONE, ATT_SECURITY_NONE, host_service_changed_range, sizeof(host_service_changed_range));
+    host_service_changed_ccc_handle = value_handle + 1;
+    host_service_changed_ccc = 0;
+    att_server_init(att_db_util_get_address(), host_att_read, host_att_write);
+}
+
 void bb_bt_host_init(void) {
     reset_classic_name_candidates();
     bb_driver_reset();
@@ -1562,6 +1699,7 @@ void bb_bt_host_init(void) {
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
     sm_set_encryption_key_size_range(7, 16);
     gatt_client_init();
+    setup_host_att_server();
     device_information_service_client_init();
     battery_service_client_init();
     hids_host_init(hids_descriptor_storage, sizeof(hids_descriptor_storage));
@@ -1661,6 +1799,8 @@ bool bb_bt_host_disconnect_current(void) {
         if (powered_off) {
             manual_disconnect_pending = true;
             manual_disconnect_at = now + 900u;
+        } else if (current_identity.kind == BB_CONTROLLER_DUALSHOCK4 && classic_handle != HCI_CON_HANDLE_INVALID) {
+            if (gap_disconnect(classic_handle) != ERROR_CODE_SUCCESS && classic_hid_cid) hid_host_disconnect(classic_hid_cid);
         } else if (classic_hid_cid) {
             hid_host_disconnect(classic_hid_cid);
         } else {
