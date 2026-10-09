@@ -5,6 +5,7 @@
 #include "controller_input.h"
 #include "usb_device.h"
 #include "btstack.h"
+#include "btstack_version.h"
 #include "ble/gatt-service/hids_host.h"
 #include "ble/gatt-service/device_information_service_client.h"
 #include "ble/gatt-service/battery_service_client.h"
@@ -20,6 +21,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+
+#if defined(ENABLE_LE_SECURE_CONNECTIONS) && (BTSTACK_VERSION_MAJOR > 1 || (BTSTACK_VERSION_MAJOR == 1 && (BTSTACK_VERSION_MINOR > 8 || (BTSTACK_VERSION_MINOR == 8 && BTSTACK_VERSION_PATCH >= 2))))
+#define BB_SM_DEFAULT_SC_ONLY true
+#else
+#define BB_SM_DEFAULT_SC_ONLY false
+#endif
 
 #define BB_HID_DESCRIPTOR_STORAGE 2048
 #define BB_CLASSIC_HID_STORAGE 2048
@@ -65,8 +72,17 @@ static bool ble_connecting;
 static uint32_t ble_attempt_started;
 static bool ble_setup_started;
 static bool ble_bond_retry;
+static bool ble_security_retry;
+static bool ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY;
+static bool ble_security_retry_pending;
+static uint32_t ble_security_retry_at;
 static uint8_t ultimate2c_setup_step;
 static uint32_t ultimate2c_setup_at;
+static uint8_t ultimate2c_protocol_step;
+static uint32_t ultimate2c_protocol_at;
+static uint16_t ultimate2c_protocol_handle;
+static uint16_t ultimate2c_protocol_properties;
+static bool ultimate2c_protocol_boot;
 static const char* ble_stage = "idle";
 static const char* ble_failed_stage = "none";
 static int16_t ble_setup_status = -1;
@@ -826,9 +842,13 @@ static void controller_disconnected(void) {
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
     ble_connecting = false;
     ultimate2c_setup_step = 0;
+    ultimate2c_protocol_step = 0;
+    ultimate2c_protocol_handle = 0;
+    ble_security_retry_pending = ble_security_retry_pending && pairing && !manual_disconnect_pending;
     host_service_changed_ccc = 0;
     sm_set_encryption_key_size_range(7, 16);
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+    if (ble_security_retry) sm_set_secure_connections_only_mode(BB_SM_DEFAULT_SC_ONLY);
     ble_setup_started = false;
     if (!strcmp(ble_failed_stage, "none")) ble_stage = "disconnected";
     le_custom_nintendo = false;
@@ -858,7 +878,7 @@ static void controller_disconnected(void) {
     switch2_rumble_seq = 0;
     last_controller_report_at = 0;
     if (stack_ready) {
-        start_scans();
+        if (!ble_security_retry_pending) start_scans();
         schedule_classic_reconnect(3000u);
     }
 }
@@ -916,6 +936,8 @@ static bool ble_is_8bitdo64(const char* name) {
 static void configure_ble_security(void) {
     ble_key_minimum = 7;
     ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION;
+    ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY;
+    sm_set_secure_connections_only_mode(BB_SM_DEFAULT_SC_ONLY);
     sm_set_authentication_requirements(ble_authentication);
     sm_set_encryption_key_size_range(ble_key_minimum, 16);
 }
@@ -927,6 +949,8 @@ static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const c
     ble_attempt_started = btstack_run_loop_get_time_ms();
     ble_setup_started = false;
     ble_bond_retry = false;
+    ble_security_retry = false;
+    ble_security_retry_pending = false;
     ble_stage = "connecting";
     ble_failed_stage = "none";
     ble_setup_status = -1;
@@ -946,6 +970,7 @@ static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const c
     if (status != ERROR_CODE_SUCCESS) {
         sm_set_encryption_key_size_range(7, 16);
         sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+        if (ble_security_retry) sm_set_secure_connections_only_mode(BB_SM_DEFAULT_SC_ONLY);
         ble_connecting = false;
         le_custom_nintendo = false;
         start_scans();
@@ -1010,6 +1035,11 @@ static void xbox_battery_handler(uint8_t packet_type, uint16_t channel, uint8_t*
 
 static bool ble_is_ultimate2c(void) {
     return (pending_vid == 0x2dc8 && pending_pid == 0x301b) || name_has(pending_name, "ultimate 2c wireless");
+}
+
+static bool ble_ultimate_security_retry_candidate(void) {
+    static const char* name = "8BitDo Ultimate";
+    return ble_is_ultimate2c() || (strlen(pending_name) == strlen(name) && name_has(pending_name, name));
 }
 
 static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
@@ -1085,6 +1115,49 @@ static void ble_start_hid(void) {
     if (status != ERROR_CODE_SUCCESS) ble_setup_fail(status);
 }
 
+static void ultimate2c_protocol_finish(void) {
+    ultimate2c_protocol_step = 0;
+    ble_start_hid();
+}
+
+static void ultimate2c_protocol_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
+    (void)channel;
+    if (packet_type != HCI_EVENT_PACKET || size < 2 || !ultimate2c_protocol_step || !ble_connecting || le_handle == HCI_CON_HANDLE_INVALID) return;
+    switch (hci_event_packet_get_type(packet)) {
+        case GATT_EVENT_CHARACTERISTIC_QUERY_RESULT: {
+            if (size < 32 || ultimate2c_protocol_step != 2 || gatt_event_characteristic_query_result_get_handle(packet) != le_handle) return;
+            gatt_client_characteristic_t characteristic;
+            gatt_event_characteristic_query_result_get_characteristic(packet, &characteristic);
+            if (!ultimate2c_protocol_handle) {
+                ultimate2c_protocol_handle = characteristic.value_handle;
+                ultimate2c_protocol_properties = characteristic.properties;
+            }
+            break;
+        }
+        case GATT_EVENT_CHARACTERISTIC_VALUE_QUERY_RESULT:
+            if (size < 13 || ultimate2c_protocol_step != 4 || gatt_event_characteristic_value_query_result_get_handle(packet) != le_handle ||
+                gatt_event_characteristic_value_query_result_get_value_handle(packet) != ultimate2c_protocol_handle) return;
+            if (gatt_event_characteristic_value_query_result_get_value_length(packet) == 1) {
+                ultimate2c_protocol_boot = gatt_event_characteristic_value_query_result_get_value(packet)[0] == HID_PROTOCOL_MODE_BOOT;
+            }
+            break;
+        case GATT_EVENT_QUERY_COMPLETE:
+            if (size < 9 || gatt_event_query_complete_get_handle(packet) != le_handle) return;
+            if (ultimate2c_protocol_step == 2) {
+                if (gatt_event_query_complete_get_att_status(packet) == ATT_ERROR_SUCCESS && ultimate2c_protocol_handle &&
+                    (ultimate2c_protocol_properties & ATT_PROPERTY_READ)) ultimate2c_protocol_step = 3;
+                else ultimate2c_protocol_finish();
+            } else if (ultimate2c_protocol_step == 4) {
+                if (gatt_event_query_complete_get_att_status(packet) == ATT_ERROR_SUCCESS && ultimate2c_protocol_boot &&
+                    (ultimate2c_protocol_properties & ATT_PROPERTY_WRITE_WITHOUT_RESPONSE)) ultimate2c_protocol_step = 5;
+                else ultimate2c_protocol_finish();
+            }
+            break;
+        default:
+            break;
+    }
+}
+
 static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     (void)channel;
     if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || size < 6 || hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META) return;
@@ -1144,7 +1217,14 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
     ble_setup_status = status;
     ble_pairing_reason = reencrypt ? -1 : sm_event_pairing_complete_get_reason(packet);
     if (status != ERROR_CODE_SUCCESS) {
-        if (reencrypt && pairing && !ble_bond_retry && !ble_setup_started) {
+        if (!reencrypt && pairing && status == ERROR_CODE_AUTHENTICATION_FAILURE &&
+            ble_pairing_reason == SM_REASON_AUTHENTHICATION_REQUIREMENTS && !ble_security_retry &&
+            !ble_setup_started && ble_ultimate_security_retry_candidate()) {
+            ble_security_retry = true;
+            ble_security_retry_pending = true;
+            ble_security_retry_at = btstack_run_loop_get_time_ms();
+            ble_stage = "security_retry_pending";
+        } else if (reencrypt && pairing && !ble_bond_retry && !ble_setup_started) {
             ble_bond_retry = true;
             ble_stage = "bond_repair";
             gap_delete_bonding(pending_addr_type, pending_addr);
@@ -1157,7 +1237,12 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
     if (le_custom_nintendo) {
         enable_nintendo_notifications();
     } else if (ble_is_ultimate2c()) {
-        ble_start_hid();
+        ultimate2c_protocol_step = 1;
+        ultimate2c_protocol_at = btstack_run_loop_get_time_ms();
+        ultimate2c_protocol_handle = 0;
+        ultimate2c_protocol_properties = 0;
+        ultimate2c_protocol_boot = false;
+        ble_stage = "protocol_probe";
     } else {
         ble_stage = "device_information";
         if (device_information_service_client_query(le_handle, ble_identity_handler) != ERROR_CODE_SUCCESS) ble_start_hid();
@@ -1487,6 +1572,7 @@ static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, 
             if (hci_event_gap_meta_get_subevent_code(packet) == GAP_SUBEVENT_LE_CONNECTION_COMPLETE) {
                 if (gap_subevent_le_connection_complete_get_status(packet) != ERROR_CODE_SUCCESS) {
                     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+                    if (ble_security_retry) sm_set_secure_connections_only_mode(BB_SM_DEFAULT_SC_ONLY);
                     sm_set_encryption_key_size_range(7, 16);
                     ble_setup_status = gap_subevent_le_connection_complete_get_status(packet);
                     ble_failed_stage = "connecting";
@@ -1543,6 +1629,49 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
             if (state.controller_connected) bb_bt_host_disconnect_current();
             usb_was_ready = false;
             usb_lost_since = 0;
+        }
+    }
+    if (ble_security_retry_pending && (uint32_t)(now - ble_security_retry_at) >= 100u) {
+        ble_security_retry_pending = false;
+        if (pairing && !ble_setup_started) {
+            bool reconnect = le_handle == HCI_CON_HANDLE_INVALID;
+            if (reconnect && !connection_in_progress()) {
+                bd_addr_t addr;
+                char name[sizeof(pending_name)];
+                memcpy(addr, pending_addr, sizeof(addr));
+                memcpy(name, pending_name, sizeof(name));
+                connect_ble(addr, pending_addr_type, name, false, false, pending_vid, pending_pid);
+                ble_security_retry = true;
+            }
+            if (ble_connecting) {
+                ble_authentication = SM_AUTHREQ_BONDING;
+                ble_secure_connections_only = false;
+                sm_set_secure_connections_only_mode(false);
+                sm_set_authentication_requirements(ble_authentication);
+                sm_set_encryption_key_size_range(ble_key_minimum, 16);
+                ble_attempt_started = now;
+                ble_stage = "security_retry";
+                if (!reconnect) sm_request_pairing(le_handle);
+            }
+        }
+    }
+    if (ultimate2c_protocol_step && le_handle != HCI_CON_HANDLE_INVALID && ble_connecting) {
+        if ((uint32_t)(now - ultimate2c_protocol_at) >= 6000u) {
+            ultimate2c_protocol_step = 0;
+            ble_setup_fail(ERROR_CODE_CONNECTION_TIMEOUT);
+        } else if (ultimate2c_protocol_step == 1) {
+            ultimate2c_protocol_step = 2;
+            if (gatt_client_discover_characteristics_for_handle_range_by_uuid16(ultimate2c_protocol_handler, le_handle, 1, 0xffff,
+                    ORG_BLUETOOTH_CHARACTERISTIC_PROTOCOL_MODE) != ERROR_CODE_SUCCESS) ultimate2c_protocol_step = 1;
+        } else if (ultimate2c_protocol_step == 3) {
+            ultimate2c_protocol_step = 4;
+            if (gatt_client_read_value_of_characteristic_using_value_handle(ultimate2c_protocol_handler, le_handle,
+                    ultimate2c_protocol_handle) != ERROR_CODE_SUCCESS) ultimate2c_protocol_step = 3;
+        } else if (ultimate2c_protocol_step == 5) {
+            uint8_t mode = HID_PROTOCOL_MODE_REPORT;
+            if (gatt_client_write_value_of_characteristic_without_response(le_handle, ultimate2c_protocol_handle, 1, &mode) == ERROR_CODE_SUCCESS) {
+                ultimate2c_protocol_finish();
+            }
         }
     }
     if (ultimate2c_setup_step && le_handle != HCI_CON_HANDLE_INVALID && ble_connecting) {
@@ -1848,9 +1977,9 @@ bool bb_bt_host_diagnostics(char* out, size_t size) {
         name_hex[i * 2 + 1] = digits[value & 15];
     }
     name_hex[name_length * 2] = 0;
-    snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s}",
+    snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s,\"security_retry\":%s,\"secure_connections_only\":%s}",
         name_hex, ble_key_minimum, ble_authentication, ble_pairing_reason, ble_stage, ble_failed_stage, ble_setup_status, (unsigned long)ble_attempt_count,
         ble_connecting ? "true" : "false", le_handle, hids_cid, current_controller_index,
-        classic_connecting ? "true" : "false", classic_attempt_active ? "true" : "false");
+        classic_connecting ? "true" : "false", classic_attempt_active ? "true" : "false", ble_security_retry ? "true" : "false", ble_secure_connections_only ? "true" : "false");
     return true;
 }

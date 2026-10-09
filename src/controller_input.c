@@ -202,7 +202,7 @@ bb_controller_kind_t bb_controller_identify(uint16_t vid, uint16_t pid, const ch
         if (pid == 0x2073) return BB_CONTROLLER_NSO_GAMECUBE;
     }
     if (vid == 0x045e) {
-        if (pid == 0x02e0 || pid == 0x02fd || pid == 0x02ea) return BB_CONTROLLER_XBOX_ONE;
+        if (pid == 0x02e0 || pid == 0x02fd || pid == 0x02ea || pid == 0x0b20) return BB_CONTROLLER_XBOX_ONE;
         if (pid == 0x0b13) return BB_CONTROLLER_XBOX_SERIES;
         if (pid == 0x0b0a) return BB_CONTROLLER_XBOX_ADAPTIVE;
         if (pid == 0x0b00) return BB_CONTROLLER_XBOX_ELITE;
@@ -271,6 +271,10 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     else if (kind == BB_CONTROLLER_NSO_GENESIS) labels = genesis;
     else if (kind == BB_CONTROLLER_8BITDO) {
         labels = eightbitdo;
+        if (contains_ci(name, "ultimate 2c wireless") && index < 4) {
+            static const char* face[] = {"A","B","X","Y"};
+            return face[index];
+        }
         if (contains_ci(name, "m30")) {
             if (index == 4) return "Z";
             if (index == 5) return "C";
@@ -360,6 +364,7 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
         case BB_CONTROLLER_8BITDO:
             c.buttons = 0x00003fffu;
             if (contains_ci(name, "pro 3")) c.buttons = 0x000f1fffu;
+            else if (contains_ci(name, "ultimate 2c wireless")) c.buttons = 0x00031fffu;
             else if (contains_ci(name, "ultimate") || contains_ci(name, "pro 2")) c.buttons = 0x00033fffu;
             else if (contains_ci(name, "arcade stick")) {
                 c.buttons = 0x000013ffu;

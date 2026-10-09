@@ -252,12 +252,21 @@ static void map_8bitdo_layout(bb_input_state_t* state, uint32_t* capabilities, c
     *capabilities = caps;
 }
 
+static bool is_ultimate2c(void) {
+    return identity.kind == BB_CONTROLLER_8BITDO && identity.vendor_id == 0x2dc8 && identity.product_id == 0x301b;
+}
+
 static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabilities, bool analog_lt, bool analog_rt) {
     if (!state || !capabilities) return;
     uint32_t src_buttons = state->buttons;
     uint32_t src_caps = *capabilities;
     uint32_t dst_buttons = 0;
     uint32_t dst_caps = 0;
+    if (is_ultimate2c()) {
+        static const uint8_t layout[] = {0,1,17,2,3,16,4,5,6,7,8,9,12,10,11,255};
+        map_8bitdo_layout(state, capabilities, layout, sizeof(layout));
+        return;
+    }
     bool pro3 = strstr(identity.name, "Pro 3") || strstr(identity.name, "PRO 3") || strstr(identity.name, "pro 3");
     bool arcade = eightbitdo_name_has("arcade stick") || eightbitdo_name_has("nes30 arcade");
     if (arcade) {
@@ -905,6 +914,7 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         int expected = btstack_hid_get_report_size_for_id(numbered ? report[0] : HID_REPORT_ID_UNDEFINED, HID_REPORT_TYPE_INPUT, hid_descriptor, hid_descriptor_len);
         if (expected <= 0 || length < expected + numbered) return false;
     }
+    bool ultimate2c = is_ultimate2c();
     bool home_present = false;
     bool home_pressed = false;
     bool primary_input = false;
@@ -943,8 +953,22 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             bb_state_update_battery(true, percent, 1);
             continue;
         }
+        if (ultimate2c && page == 0x02 && (usage == 0xc4 || usage == 0xc5)) {
+            primary_input = true;
+            if (usage == 0xc5) { s.lt = generic_trigger(value, minimum, maximum); analog_lt = true; }
+            else { s.rt = generic_trigger(value, minimum, maximum); analog_rt = true; }
+            continue;
+        }
         if (page != HID_USAGE_PAGE_GENERIC_DESKTOP) continue;
         if (usage >= HID_USAGE_X && usage <= HID_USAGE_HAT) primary_input = true;
+        if (ultimate2c) {
+            if (usage == HID_USAGE_X) s.x = dinput_axis(value);
+            else if (usage == HID_USAGE_Y) s.y = dinput_axis(value);
+            else if (usage == HID_USAGE_Z) s.rx = dinput_axis(value);
+            else if (usage == HID_USAGE_RZ) s.ry = dinput_axis(value);
+            else if (usage == HID_USAGE_HAT) s.dpad = value >= minimum && value <= maximum ? hat_to_dpad(value - minimum) : 0;
+            continue;
+        }
         if (identity.kind == BB_CONTROLLER_8BITDO) {
             int index = -1;
             if (usage == HID_USAGE_X) index = 0;
@@ -989,7 +1013,7 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
                 if (dy < -16384) s.dpad |= 1;
                 if (dy > 16384) s.dpad |= 2;
             }
-        } else apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
+        } else if (!ultimate2c) apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
         normalize_8bitdo_buttons(&s, &button_capabilities, analog_lt, analog_rt);
     }
     if (identity.kind == BB_CONTROLLER_8BITDO && (eightbitdo_name_has("m30") || eightbitdo_name_has("arcade stick"))) {
