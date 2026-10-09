@@ -115,6 +115,9 @@ static bool rumble_active;
 static uint8_t xbox_rumble_payload[8];
 static bool xbox_rumble_write_pending;
 static bool xbox_rumble_retry;
+static uint8_t eightbitdo64_rumble_payload[4];
+static bool eightbitdo64_rumble_write_pending;
+static bool eightbitdo64_rumble_retry;
 static uint8_t dualsense_output_seq;
 static uint8_t ds4_output_report[78];
 static bool ds4_descriptor_ready;
@@ -397,7 +400,34 @@ static bool send_switch_rumble(uint8_t strength) {
     return hid_host_send_report(classic_hid_cid, 0x10, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
+static bool eightbitdo64_ble_connected(void) {
+    return le_handle != HCI_CON_HANDLE_INVALID && hids_cid && current_identity.kind == BB_CONTROLLER_8BITDO && current_identity.vendor_id == 0x2dc8 && current_identity.product_id == 0x3019;
+}
+
+static bool send_8bitdo64_ble_rumble(uint8_t strength) {
+    eightbitdo64_rumble_retry = false;
+    if (!eightbitdo64_ble_connected()) return false;
+    if (eightbitdo64_rumble_write_pending) {
+        eightbitdo64_rumble_retry = true;
+        return false;
+    }
+    uint8_t magnitude = (uint8_t)(((uint16_t)strength * 100u) / 255u);
+    eightbitdo64_rumble_payload[0] = magnitude;
+    eightbitdo64_rumble_payload[1] = magnitude;
+    eightbitdo64_rumble_payload[2] = 0;
+    eightbitdo64_rumble_payload[3] = 0;
+    uint8_t status = hids_host_send_write_report(hids_cid, 5, HID_REPORT_TYPE_OUTPUT, eightbitdo64_rumble_payload, sizeof(eightbitdo64_rumble_payload));
+    if (status == ERROR_CODE_SUCCESS) {
+        eightbitdo64_rumble_write_pending = true;
+        return true;
+    }
+    eightbitdo64_rumble_retry = status == ERROR_CODE_COMMAND_DISALLOWED || status == GATT_CLIENT_IN_WRONG_STATE;
+    if (status == ERROR_CODE_UNSUPPORTED_FEATURE_OR_PARAMETER_VALUE) bb_state_set_rumble_supported(false);
+    return false;
+}
+
 static bool send_8bitdo_dinput_rumble(uint8_t strength) {
+    if (eightbitdo64_ble_connected()) return send_8bitdo64_ble_rumble(strength);
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_8BITDO || classic_switch_protocol) return false;
     uint8_t payload[4] = {strength, strength, 0, 0};
     return hid_host_send_report(classic_hid_cid, 0x05, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
@@ -511,7 +541,7 @@ static void service_rumble(void) {
             rumble_active_strength = strength;
             rumble_stop_at = now + duration;
             rumble_refresh_at = now + 80u;
-        } else if (xbox_ble_connected() && xbox_rumble_retry) {
+        } else if ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry)) {
             rumble_request_pending = true;
         }
     }
@@ -522,7 +552,7 @@ static void service_rumble(void) {
     }
     if (rumble_active && (int32_t)(now - rumble_stop_at) >= 0) {
         bool stopped = send_current_rumble(0);
-        if (!stopped && xbox_ble_connected() && xbox_rumble_retry) return;
+        if (!stopped && ((xbox_ble_connected() && xbox_rumble_retry) || (eightbitdo64_ble_connected() && eightbitdo64_rumble_retry))) return;
         rumble_active = false;
         rumble_active_strength = 0;
         rumble_refresh_at = 0;
@@ -698,6 +728,7 @@ static void refresh_classic_identity(const char* name, uint16_t vid, uint16_t pi
     if (vid) updated.vendor_id = vid;
     if (pid) updated.product_id = pid;
     const char* resolved = name && name[0] ? name : current_identity.name;
+    if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "sn30 pro") && name_has(resolved, "8bitdo controller")) resolved = current_identity.name;
     if (updated.vendor_id == 0x2dc8 && updated.product_id == 0x9020) resolved = "8BitDo Micro";
     if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "arcade stick") && name_has(resolved, "pro controller")) resolved = current_identity.name;
     bb_controller_kind_t kind = bb_controller_identify(updated.vendor_id, updated.product_id, resolved);
@@ -778,6 +809,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
         identity_name = stored_name;
     }
     if (vid == 0x2dc8 && pid == 0x301b) identity_name = "8BitDo Ultimate 2C Wireless";
+    if (vid == 0x2dc8 && pid == 0x3019) identity_name = "8BitDo 64";
     bb_controller_display_name(current_identity.kind, identity_name, current_identity.name, sizeof(current_identity.name));
     uint8_t controller_index = 0;
     if (!bb_controller_activate_or_create(addr, vid, pid, current_identity.name, &controller_index)) return;
@@ -859,6 +891,8 @@ static void controller_disconnected(void) {
     hids_cid = 0;
     xbox_rumble_write_pending = false;
     xbox_rumble_retry = false;
+    eightbitdo64_rumble_write_pending = false;
+    eightbitdo64_rumble_retry = false;
     dualsense_output_seq = 0;
     switch_output_seq = 0;
     classic_switch_setup_sent = false;
@@ -923,16 +957,6 @@ static void connect_classic(const uint8_t addr[6], const char* name) {
     }
 }
 
-static bool ble_is_8bitdo64(const char* name) {
-    static const char* aliases[] = {"8BitDo 64 Bluetooth Controller", "8BitDo 64 Controller", "8BitDo 64", "8BitDo 64 BT"};
-    if (name) {
-        for (uint8_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); ++i) {
-            if (strlen(name) == strlen(aliases[i]) && name_has(name, aliases[i])) return true;
-        }
-    }
-    return false;
-}
-
 static void configure_ble_security(void) {
     ble_key_minimum = 7;
     ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION;
@@ -944,7 +968,7 @@ static void configure_ble_security(void) {
 
 static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const char* name, bool custom_nintendo, bool gamecube, uint16_t vid, uint16_t pid) {
     const char* resolved_name = name && name[0] ? name : remembered_name(addr);
-    if (ble_is_8bitdo64(resolved_name) || connection_in_progress()) return;
+    if (connection_in_progress()) return;
     ble_connecting = true;
     ble_attempt_started = btstack_run_loop_get_time_ms();
     ble_setup_started = false;
@@ -1088,6 +1112,7 @@ static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet,
             break;
         }
         case GATTSERVICE_SUBEVENT_HID_REPORT_WRITTEN:
+            if (gattservice_subevent_hid_report_written_get_hids_cid(packet) == hids_cid && gattservice_subevent_hid_report_written_get_report_id(packet) == 5) eightbitdo64_rumble_write_pending = false;
             if (gattservice_subevent_hid_report_written_get_hids_cid(packet) == hids_cid && gattservice_subevent_hid_report_written_get_report_id(packet) == 3) xbox_rumble_write_pending = false;
             break;
         case GATTSERVICE_SUBEVENT_HID_SERVICE_DISCONNECTED:
@@ -1947,7 +1972,7 @@ bool bb_bt_host_disconnect_current(void) {
 }
 
 bool bb_bt_host_rumble_test(uint8_t strength, uint16_t duration_ms) {
-    if (!classic_hid_cid && !xbox_ble_connected()) return false;
+    if (!classic_hid_cid && !xbox_ble_connected() && !eightbitdo64_ble_connected()) return false;
     bb_runtime_state_t state;
     bb_state_get(&state);
     if (!state.rumble_supported) return false;

@@ -271,6 +271,14 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     else if (kind == BB_CONTROLLER_NSO_GENESIS) labels = genesis;
     else if (kind == BB_CONTROLLER_8BITDO) {
         labels = eightbitdo;
+        if (contains_ci(name, "8bitdo 64")) {
+            static const char* labels64[] = {"A","B","C Left","C Right","L","R","ZL","ZR","Select","Start","Stick Click","C Up","Home","Screenshot","C Down"};
+            return index < sizeof(labels64) / sizeof(labels64[0]) ? labels64[index] : "Unused";
+        }
+        if (contains_ci(name, "pro 2")) {
+            if (index == 16) return "P1";
+            if (index == 17) return "P2";
+        }
         if (contains_ci(name, "ultimate 2c wireless") && index < 4) {
             static const char* face[] = {"A","B","X","Y"};
             return face[index];
@@ -363,7 +371,13 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
             break;
         case BB_CONTROLLER_8BITDO:
             c.buttons = 0x00003fffu;
-            if (contains_ci(name, "pro 3")) c.buttons = 0x000f1fffu;
+            if (contains_ci(name, "8bitdo 64")) {
+                c.buttons = 0x00007fffu;
+                c.right_stick = 0;
+            }
+            else if (contains_ci(name, "sn30 pro")) c.buttons = 0x00001fffu;
+            else if (contains_ci(name, "pro 3")) c.buttons = 0x000f1fffu;
+            else if (contains_ci(name, "pro 2")) c.buttons = 0x00031fffu;
             else if (contains_ci(name, "ultimate 2c wireless")) c.buttons = 0x00031fffu;
             else if (contains_ci(name, "ultimate") || contains_ci(name, "pro 2")) c.buttons = 0x00033fffu;
             else if (contains_ci(name, "arcade stick")) {
@@ -459,11 +473,13 @@ void bb_controller_display_name(bb_controller_kind_t kind, const char* raw_name,
             else if (contains_ci(raw_name, "x mode")) value = "8BitDo Arcade Stick - X Mode";
             else value = "8BitDo Arcade Stick";
         }
+        else if (contains_ci(raw_name, "8bitdo 64")) value = "8BitDo 64";
         else if (contains_ci(raw_name, "micro")) value = "8BitDo Micro";
         else if (contains_ci(raw_name, "pro 3")) value = "8BitDo Pro 3";
         else if (contains_ci(raw_name, "pro 2")) value = "8BitDo Pro 2";
         else if (contains_ci(raw_name, "ultimate 2c wireless")) value = "8BitDo Ultimate 2C Wireless";
         else if (contains_ci(raw_name, "ultimate")) value = "8BitDo Ultimate Controller";
+        else if (contains_ci(raw_name, "sn30 pro")) value = "8BitDo SN30 Pro";
         else if (contains_ci(raw_name, "sn30")) value = "8BitDo SN30 Controller";
         else if (contains_ci(raw_name, "m30")) value = "8BitDo M30 Controller";
     } else if (kind == BB_CONTROLLER_GENERIC && raw_name && raw_name[0]) {

@@ -116,6 +116,11 @@ static void send_profiles(const char* id) {
     bb_controller_name_get(controller_index, display, sizeof(display));
     bb_controller_kind_t kind = bb_controller_identify(controller->native_vendor_id, controller->native_product_id, controller->name);
     bb_controller_capabilities_t caps = bb_controller_capabilities(kind, controller->name);
+    if (kind == BB_CONTROLLER_8BITDO && strstr(controller->name, "Pro 2")) {
+        bb_runtime_state_t runtime;
+        bb_state_get(&runtime);
+        if (runtime.controller_connected && runtime.controller_index == controller_index && runtime.button_capabilities) caps.buttons = runtime.button_capabilities & ~(1u << 13);
+    }
     char out[2048];
     size_t pos = 0;
     pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "{\"controller_index\":%u,\"controller_id\":%lu,\"controller_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"active\":%u,\"capabilities\":{\"buttons\":%lu,\"dpad\":%s,\"left_stick\":%s,\"right_stick\":%s,\"left_trigger\":%s,\"right_trigger\":%s},\"labels\":[", controller_index, (unsigned long)controller->id, display, (unsigned)kind, bb_controller_kind_name(kind), controller->native_vendor_id, controller->native_product_id, controller->active_profile, (unsigned long)caps.buttons, caps.dpad ? "true" : "false", caps.left_stick ? "true" : "false", caps.right_stick ? "true" : "false", caps.left_trigger ? "true" : "false", caps.right_trigger ? "true" : "false");
