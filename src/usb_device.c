@@ -9,20 +9,25 @@
 #include "pico/stdlib.h"
 #include "pico/flash.h"
 #include "pico/unique_id.h"
+#include "hardware/watchdog.h"
 #include "tusb.h"
 #include <string.h>
 
 static critical_section_t usb_lock;
-static bb_gamepad_report_t pending;
-static bool dirty;
+static bb_gamepad_report_t pending_slots[BB_MAX_SLOTS];
+static uint8_t usb_slot;
+#define pending pending_slots[usb_slot]
+static bool dirty_slots[BB_MAX_SLOTS];
+#define dirty dirty_slots[usb_slot]
 static bool reenumerate;
 static volatile bool usb_mounted;
 static uint32_t switch_last_send;
 
 void bb_usb_submit(const bb_gamepad_report_t* report) {
     critical_section_enter_blocking(&usb_lock);
-    pending = *report;
-    dirty = true;
+    uint8_t slot = bb_slot_current();
+    pending_slots[slot] = *report;
+    dirty_slots[slot] = true;
     critical_section_exit(&usb_lock);
 }
 
@@ -135,7 +140,7 @@ static void send_pending(void) {
     else if (mode == BB_OUTPUT_SWITCH) {
         ok = send_switch_state(&report);
         if (ok) switch_last_send = to_ms_since_boot(get_absolute_time());
-    } else if (tud_hid_ready()) {
+    } else if (tud_hid_n_ready(usb_slot)) {
         hid_gamepad_report_t gamepad = {0};
         gamepad.x = report.x;
         gamepad.y = report.y;
@@ -145,14 +150,22 @@ static void send_pending(void) {
         gamepad.ry = (int8_t)((int)report.rt - 128);
         gamepad.hat = report.hat;
         gamepad.buttons = report.buttons;
-        ok = tud_hid_report(REPORT_ID_GAMEPAD, &gamepad, sizeof(gamepad));
+        ok = tud_hid_n_report(usb_slot, REPORT_ID_GAMEPAD, &gamepad, sizeof(gamepad));
     }
-    bb_state_note_usb_report(ok);
+    bb_state_note_slot_usb_report(usb_slot, ok);
     if (!ok) {
         critical_section_enter_blocking(&usb_lock);
         dirty = true;
         critical_section_exit(&usb_lock);
     }
+}
+
+static void feedback_reset_all(void) {
+    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+        bb_feedback_select(i);
+        bb_feedback_reset();
+    }
+    bb_feedback_select(0);
 }
 
 static void handle_reenumeration(void) {
@@ -166,7 +179,7 @@ static void handle_reenumeration(void) {
     if (!requested) return;
     usb_mounted = false;
     bb_state_set_usb_ready(false);
-    bb_feedback_reset();
+    feedback_reset_all();
     tud_disconnect();
     sleep_ms(120);
     switch_last_send = 0;
@@ -178,34 +191,45 @@ void bb_usb_core1(void) {
     critical_section_init(&usb_lock);
     tusb_init();
     while (true) {
-        if (bb_output_mode() == BB_OUTPUT_MISTER) bb_feedback_poll(to_ms_since_boot(get_absolute_time()));
+        if (bb_output_mode() == BB_OUTPUT_MISTER) {
+            for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+                bb_feedback_select(i);
+                bb_feedback_poll(to_ms_since_boot(get_absolute_time()));
+            }
+        }
         tud_task();
         bb_cdc_poll();
         handle_reenumeration();
-        send_pending();
+        for (usb_slot = 0; usb_slot < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++usb_slot) send_pending();
+        usb_slot = 0;
         bb_config_flush_pending();
+        if (bb_mode_restart_pending()) {
+            sleep_ms(300);
+            watchdog_reboot(0, 0, 0);
+            while (true) tight_loop_contents();
+        }
         tight_loop_contents();
     }
 }
 
 void tud_mount_cb(void) {
-    bb_feedback_reset();
+    feedback_reset_all();
     usb_mounted = true;
     bb_state_set_usb_ready(true);
     critical_section_enter_blocking(&usb_lock);
-    dirty = true;
+    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) dirty_slots[i] = true;
     critical_section_exit(&usb_lock);
 }
 
 void tud_umount_cb(void) {
-    bb_feedback_reset();
+    feedback_reset_all();
     usb_mounted = false;
     bb_state_set_usb_ready(false);
 }
 
 void tud_suspend_cb(bool remote_wakeup_en) {
     (void)remote_wakeup_en;
-    bb_feedback_stop();
+    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) { bb_feedback_select(i); bb_feedback_stop(); }
 }
 
 void tud_resume_cb(void) {
@@ -214,18 +238,20 @@ void tud_resume_cb(void) {
 }
 
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
-    if (instance != 0 || bb_output_mode() != BB_OUTPUT_MISTER) return 0;
+    if (instance >= (bb_multi_mode() ? BB_MAX_SLOTS : 1) || bb_output_mode() != BB_OUTPUT_MISTER) return 0;
+    bb_feedback_select(instance);
     return bb_feedback_get(report_id, report_type == HID_REPORT_TYPE_FEATURE, buffer, reqlen);
 }
 
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
-    if (instance != 0 || bb_output_mode() != BB_OUTPUT_MISTER || !buffer) return;
+    if (instance >= (bb_multi_mode() ? BB_MAX_SLOTS : 1) || bb_output_mode() != BB_OUTPUT_MISTER || !buffer) return;
     if (report_type != HID_REPORT_TYPE_OUTPUT && report_type != HID_REPORT_TYPE_FEATURE) return;
     if (!report_id) {
         if (!bufsize) return;
         report_id = *buffer++;
         --bufsize;
     }
+    bb_feedback_select(instance);
     bb_feedback_set(report_id, report_type == HID_REPORT_TYPE_FEATURE, buffer, bufsize);
 }
 

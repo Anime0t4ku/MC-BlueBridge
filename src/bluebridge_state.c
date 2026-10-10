@@ -1,17 +1,73 @@
 #include "bluebridge_state.h"
 #include "config_store.h"
 #include "pico/critical_section.h"
+#include "pico/platform.h"
 #include <stdio.h>
 #include <string.h>
 
 static critical_section_t lock;
-static bb_runtime_state_t runtime_state;
+static bb_runtime_state_t runtime_slots[BB_MAX_SLOTS];
+static uint8_t io_slot;
+static bool boot_multi;
+static volatile bool mode_restart;
+#define runtime_state runtime_slots[bb_slot_current()]
 static bb_config_t config_state;
 static volatile bool config_save_pending;
 static bb_config_t save_copy;
-static uint32_t capture_previous_buttons;
-static uint32_t capture_button_mask;
+static uint32_t capture_previous[BB_MAX_SLOTS];
+#define capture_previous_buttons capture_previous[bb_slot_current()]
+static uint32_t capture_masks[BB_MAX_SLOTS];
+#define capture_button_mask capture_masks[bb_slot_current()]
 static int management_controller_index = -1;
+
+bool bb_multi_mode(void) { return boot_multi; }
+bool bb_mode_restart_pending(void) { return mode_restart; }
+void bb_slot_enter(uint8_t slot) { if (slot < BB_MAX_SLOTS) io_slot = slot; }
+uint8_t bb_slot_current(void) {
+    if (!boot_multi) return 0;
+    if (!get_core_num()) return io_slot;
+    for (uint8_t i = 0; i < BB_MAX_SLOTS; ++i) {
+        if (runtime_slots[i].controller_connected && runtime_slots[i].controller_index == management_controller_index) return i;
+    }
+    return 0;
+}
+void bb_state_get_slot(uint8_t slot, bb_runtime_state_t* out) {
+    if (!out || slot >= BB_MAX_SLOTS) return;
+    critical_section_enter_blocking(&lock);
+    *out = runtime_slots[slot];
+    critical_section_exit(&lock);
+}
+int bb_controller_slot(uint8_t controller) {
+    int slot = -1;
+    critical_section_enter_blocking(&lock);
+    for (uint8_t i = 0; i < (boot_multi ? BB_MAX_SLOTS : 1); ++i) {
+        if (runtime_slots[i].controller_connected && runtime_slots[i].controller_index == controller) slot = i;
+    }
+    critical_section_exit(&lock);
+    return slot;
+}
+bool bb_multi_mode_set(bool enabled) {
+    critical_section_enter_blocking(&lock);
+    if (config_state.multi_controller != enabled) {
+        if (enabled) {
+            config_state.single_output_mode = config_state.output_mode;
+            config_state.output_mode = BB_OUTPUT_MISTER;
+        } else {
+            uint8_t mode = config_state.single_output_mode;
+            config_state.output_mode = mode >= BB_OUTPUT_MISTER && mode <= BB_OUTPUT_SWITCH ? mode : BB_OUTPUT_MISTER;
+        }
+        config_state.multi_controller = enabled;
+        config_save_pending = true;
+        mode_restart = true;
+    }
+    critical_section_exit(&lock);
+    return true;
+}
+static uint8_t input_controller_index_locked(void) {
+    if (boot_multi && !get_core_num()) return runtime_state.controller_index >= 0 ? (uint8_t)runtime_state.controller_index : 0xff;
+    if (boot_multi && get_core_num() && management_controller_index >= 0) return (uint8_t)management_controller_index;
+    return config_state.active_controller;
+}
 
 static void set_name(char* dst, size_t size, const char* src, const char* fallback) {
     const char* value = src && src[0] ? src : fallback;
@@ -70,13 +126,14 @@ uint32_t bb_config_checksum(const bb_config_t* cfg) {
 
 void bb_state_init(void) {
     critical_section_init(&lock);
-    memset(&runtime_state, 0, sizeof(runtime_state));
-    runtime_state.controller_index = -1;
-    runtime_state.captured_button = 0xff;
-    runtime_state.report.hat = 0;
+    memset(runtime_slots, 0, sizeof(runtime_slots));
+    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) {
+        runtime_slots[i].controller_index = -1;
+        runtime_slots[i].captured_button = 0xff;
+    }
     if (!bb_config_load(&config_state)) {
         init_defaults(&config_state);
-    } else if (config_state.schema == 8 || config_state.schema == 9 || config_state.schema == 10) {
+    } else if (config_state.schema == 8 || config_state.schema == 9 || config_state.schema == 10 || config_state.schema == 11) {
         config_state.schema = BB_CONFIG_SCHEMA;
         if (config_state.output_mode < BB_OUTPUT_MISTER || config_state.output_mode > BB_OUTPUT_SWITCH) config_state.output_mode = BB_OUTPUT_MISTER;
         config_save_pending = true;
@@ -86,6 +143,9 @@ void bb_state_init(void) {
         config_state.output_mode = BB_OUTPUT_MISTER;
         config_save_pending = true;
     }
+    boot_multi = config_state.multi_controller == 1;
+    config_state.multi_controller = boot_multi;
+    if (boot_multi) config_state.output_mode = BB_OUTPUT_MISTER;
 }
 
 void bb_state_set_controller(bool connected, int idx, const char* name) {
@@ -120,25 +180,25 @@ void bb_state_set_controller(bool connected, int idx, const char* name) {
 
 void bb_state_set_scanning(bool scanning) {
     critical_section_enter_blocking(&lock);
-    runtime_state.bt_scanning = scanning;
+    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) runtime_slots[i].bt_scanning = scanning;
     critical_section_exit(&lock);
 }
 
 void bb_state_set_pairing(bool pairing) {
     critical_section_enter_blocking(&lock);
-    runtime_state.pairing = pairing;
+    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) runtime_slots[i].pairing = pairing;
     critical_section_exit(&lock);
 }
 
 void bb_state_set_bt_ready(bool ready) {
     critical_section_enter_blocking(&lock);
-    runtime_state.bt_ready = ready;
+    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) runtime_slots[i].bt_ready = ready;
     critical_section_exit(&lock);
 }
 
 void bb_state_set_usb_ready(bool ready) {
     critical_section_enter_blocking(&lock);
-    runtime_state.usb_ready = ready;
+    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) runtime_slots[i].usb_ready = ready;
     critical_section_exit(&lock);
 }
 
@@ -255,6 +315,13 @@ void bb_capture_clear_result(void) {
 void bb_state_get(bb_runtime_state_t* out) {
     critical_section_enter_blocking(&lock);
     *out = runtime_state;
+    if (boot_multi && get_core_num() && out->controller_index != management_controller_index) {
+        bool bt = out->bt_ready, usb = out->usb_ready, pair = out->pairing, scan = out->bt_scanning;
+        memset(out, 0, sizeof(*out));
+        out->controller_index = -1;
+        out->captured_button = 0xff;
+        out->bt_ready = bt; out->usb_ready = usb; out->pairing = pair; out->bt_scanning = scan;
+    }
     critical_section_exit(&lock);
 }
 
@@ -267,7 +334,7 @@ void bb_config_get(bb_config_t* out) {
 void bb_active_profile_get(bb_profile_t* out) {
     critical_section_enter_blocking(&lock);
     bb_controller_t* controller = NULL;
-    if (config_state.controller_count && config_state.active_controller < config_state.controller_count) controller = &config_state.controllers[config_state.active_controller];
+    if (config_state.controller_count && input_controller_index_locked() < config_state.controller_count) controller = &config_state.controllers[input_controller_index_locked()];
     if (controller && controller->profile_count && controller->active_profile < controller->profile_count) *out = controller->profiles[controller->active_profile];
     else init_profile(out, 0, 1, "Default");
     critical_section_exit(&lock);
@@ -275,7 +342,7 @@ void bb_active_profile_get(bb_profile_t* out) {
 
 static uint8_t selected_controller_index_locked(void) {
     if (management_controller_index >= 0 && management_controller_index < config_state.controller_count) return (uint8_t)management_controller_index;
-    if (config_state.controller_count && config_state.active_controller < config_state.controller_count) return config_state.active_controller;
+    if (config_state.controller_count && input_controller_index_locked() < config_state.controller_count) return config_state.active_controller;
     return 0;
 }
 
@@ -296,9 +363,10 @@ uint8_t bb_selected_controller_index(void) {
 
 void bb_active_controller_get(bb_controller_t* out, uint8_t* active_index) {
     critical_section_enter_blocking(&lock);
-    bb_controller_t* controller = selected_controller_locked();
+    uint8_t input_index = boot_multi && !get_core_num() ? input_controller_index_locked() : selected_controller_index_locked();
+    bb_controller_t* controller = input_index < config_state.controller_count ? &config_state.controllers[input_index] : NULL;
     if (controller) {
-        uint8_t index = selected_controller_index_locked();
+        uint8_t index = input_index;
         *out = *controller;
         if (active_index) *active_index = index;
     } else {
@@ -311,8 +379,8 @@ void bb_active_controller_get(bb_controller_t* out, uint8_t* active_index) {
 uint8_t bb_active_profile_index(void) {
     uint8_t index = 0;
     critical_section_enter_blocking(&lock);
-    if (config_state.controller_count && config_state.active_controller < config_state.controller_count) {
-        bb_controller_t* controller = &config_state.controllers[config_state.active_controller];
+    if (config_state.controller_count && input_controller_index_locked() < config_state.controller_count) {
+        bb_controller_t* controller = &config_state.controllers[input_controller_index_locked()];
         if (controller->profile_count && controller->active_profile < controller->profile_count) index = controller->active_profile;
     }
     critical_section_exit(&lock);
@@ -344,6 +412,14 @@ void bb_config_flush_pending(void) {
     }
     critical_section_exit(&lock);
     if (save) bb_config_save(&save_copy);
+}
+
+void bb_state_note_slot_usb_report(uint8_t slot, bool sent) {
+    if (slot >= BB_MAX_SLOTS) return;
+    critical_section_enter_blocking(&lock);
+    if (sent) runtime_slots[slot].usb_reports++;
+    else runtime_slots[slot].dropped_usb_reports++;
+    critical_section_exit(&lock);
 }
 
 void bb_state_note_usb_report(bool sent) {
@@ -493,8 +569,10 @@ bool bb_profile_set_tuning(uint8_t profile_index, uint8_t invert_x, uint8_t inve
             profile->deadzone_left = deadzone_left;
             profile->deadzone_right = deadzone_right;
             profile->trigger_deadzone = trigger_deadzone;
-            profile->turbo_rate_hz = turbo_rate_hz;
-            profile->turbo_mask = turbo_mask;
+            if (!boot_multi) {
+                profile->turbo_rate_hz = turbo_rate_hz;
+                profile->turbo_mask = turbo_mask;
+            }
             config_save_pending = true;
             ok = true;
         }
@@ -661,6 +739,12 @@ bool bb_controller_forget(uint8_t index, uint8_t address_out[6]) {
         }
         memset(config_state.controller_names[config_state.controller_count - 1], 0, BB_MAX_NAME);
         config_state.controller_count--;
+        if (boot_multi) {
+            for (unsigned slot = 0; slot < BB_MAX_SLOTS; ++slot) {
+                if (runtime_slots[slot].controller_index == index) runtime_slots[slot].controller_index = -1;
+                else if (runtime_slots[slot].controller_index > index) runtime_slots[slot].controller_index--;
+            }
+        }
         if (config_state.controller_count == 0) config_state.active_controller = 0;
         else if (config_state.active_controller > index) config_state.active_controller--;
         else if (config_state.active_controller >= config_state.controller_count) config_state.active_controller = 0;
@@ -708,8 +792,8 @@ bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_
             set_name(controller->name, sizeof(controller->name), name, "Bluetooth Controller");
             changed = true;
         }
-        config_state.active_controller = index;
-        management_controller_index = index;
+        if (!boot_multi) config_state.active_controller = index;
+        if (!boot_multi || management_controller_index < 0) management_controller_index = index;
         if (changed) config_save_pending = true;
         ok = true;
     } else if (config_state.controller_count < BB_MAX_CONTROLLERS) {
@@ -728,8 +812,8 @@ bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_
         controller->mister_identity = identity;
         init_profile(&controller->profiles[0], config_state.next_profile_id++, identity, "Default");
         controller->profiles[0].mister_mapping_mode = 0;
-        config_state.active_controller = index;
-        management_controller_index = index;
+        if (!boot_multi) config_state.active_controller = index;
+        if (!boot_multi || management_controller_index < 0) management_controller_index = index;
         config_save_pending = true;
         ok = true;
     }
@@ -757,6 +841,15 @@ bool bb_controller_select(uint8_t index) {
     bool ok = false;
     critical_section_enter_blocking(&lock);
     if (index < config_state.controller_count) {
+        if (boot_multi && management_controller_index != index) {
+            for (unsigned slot = 0; slot < BB_MAX_SLOTS; ++slot) {
+                runtime_slots[slot].capture_mode = BB_CAPTURE_NONE;
+                runtime_slots[slot].capture_ready = false;
+                runtime_slots[slot].captured_button = 0xff;
+                capture_masks[slot] = 0;
+                capture_previous[slot] = runtime_slots[slot].raw_buttons;
+            }
+        }
         management_controller_index = index;
         ok = true;
     }
@@ -765,7 +858,7 @@ bool bb_controller_select(uint8_t index) {
 }
 
 bool bb_output_mode_set(bb_output_mode_t mode) {
-    if (mode < BB_OUTPUT_MISTER || mode > BB_OUTPUT_SWITCH) return false;
+    if (mode < BB_OUTPUT_MISTER || mode > BB_OUTPUT_SWITCH || (boot_multi && mode != BB_OUTPUT_MISTER)) return false;
     critical_section_enter_blocking(&lock);
     config_state.output_mode = (uint8_t)mode;
     config_save_pending = true;
@@ -774,10 +867,11 @@ bool bb_output_mode_set(bb_output_mode_t mode) {
 }
 
 uint16_t bb_current_mister_identity(void) {
+    if (boot_multi) return 0;
     uint16_t identity = 1;
     critical_section_enter_blocking(&lock);
-    if (config_state.controller_count && config_state.active_controller < config_state.controller_count) {
-        bb_controller_t* controller = &config_state.controllers[config_state.active_controller];
+    if (config_state.controller_count && input_controller_index_locked() < config_state.controller_count) {
+        bb_controller_t* controller = &config_state.controllers[input_controller_index_locked()];
         if (controller->profile_count && controller->active_profile < controller->profile_count) {
             bb_profile_t* profile = &controller->profiles[controller->active_profile];
             if (profile->mister_identity) identity = profile->mister_identity;
@@ -802,7 +896,7 @@ const char* bb_output_mode_name(bb_output_mode_t mode) {
 }
 
 bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
-    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8 && cfg->schema != 9 && cfg->schema != 10) || bb_config_checksum(cfg) != checksum) return false;
+    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8 && cfg->schema != 9 && cfg->schema != 10 && cfg->schema != 11) || bb_config_checksum(cfg) != checksum) return false;
     if (cfg->controller_count > BB_MAX_CONTROLLERS) return false;
     if (cfg->controller_count && cfg->active_controller >= cfg->controller_count) return false;
     for (uint8_t i = 0; i < cfg->controller_count; ++i) {
@@ -811,7 +905,7 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
     }
     bb_config_t value = *cfg;
     value.schema = BB_CONFIG_SCHEMA;
-    if (cfg->schema != BB_CONFIG_SCHEMA) memset(value.adapter_name, 0, sizeof(value.adapter_name));
+    if (cfg->schema < 11) memset(value.adapter_name, 0, sizeof(value.adapter_name));
     value.adapter_name[BB_MAX_NAME - 1] = 0;
     char clean_adapter_name[BB_MAX_NAME] = {0};
     set_name(clean_adapter_name, sizeof(clean_adapter_name), value.adapter_name, "");
@@ -823,6 +917,9 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
         memcpy(value.controller_names[i], clean, sizeof(clean));
     }
     if (value.output_mode < BB_OUTPUT_MISTER || value.output_mode > BB_OUTPUT_SWITCH) value.output_mode = BB_OUTPUT_MISTER;
+    if (value.multi_controller > 1) return false;
+    if (value.multi_controller) value.output_mode = BB_OUTPUT_MISTER;
+    if (value.multi_controller != boot_multi) mode_restart = true;
     bb_config_set(&value, true);
     return true;
 }
@@ -830,6 +927,7 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
 bool bb_config_reset(void) {
     bb_config_t fresh;
     init_defaults(&fresh);
+    if (boot_multi) mode_restart = true;
     bb_config_set(&fresh, true);
     return true;
 }

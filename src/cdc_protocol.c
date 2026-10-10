@@ -49,7 +49,7 @@ static void write_text(const char* text) {
 }
 
 static void send_result(const char* id, const char* status, const char* payload) {
-    char out[2048];
+    char out[4096];
     snprintf(out, sizeof(out), "BB1|%s|%s|%s\n", id && id[0] ? id : "0", status, payload ? payload : "");
     write_text(out);
 }
@@ -72,6 +72,10 @@ static void send_status(const char* id) {
     uint8_t output_mode = bb_output_mode_value();
     char out[1024];
     snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"bt_ready\":%s,\"usb_ready\":%s,\"controller_connected\":%s,\"pairing\":%s,\"controller\":\"%s\",\"controller_index\":%d,\"active_profile\":%u,\"profile\":\"%s\",\"output_mode\":%u,\"output\":\"%s\",\"bt_reports\":%lu,\"usb_reports\":%lu,\"dropped_usb_reports\":%lu,\"raw_buttons\":%lu,\"button_capabilities\":%lu,\"battery_supported\":%s,\"battery_percent\":%u,\"battery_state\":%u,\"rumble_supported\":%s,\"capture_mode\":%u}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, state.bt_ready ? "true" : "false", state.usb_ready ? "true" : "false", state.controller_connected ? "true" : "false", state.pairing ? "true" : "false", state.controller_name, state.controller_index, active_profile, profile.name, output_mode, bb_output_mode_name((bb_output_mode_t)output_mode), (unsigned long)state.bt_reports, (unsigned long)state.usb_reports, (unsigned long)state.dropped_usb_reports, (unsigned long)state.raw_buttons, (unsigned long)state.button_capabilities, state.battery_supported ? "true" : "false", state.battery_percent, state.battery_state, state.rumble_supported ? "true" : "false", state.capture_mode);
+    size_t pos = strlen(out);
+    if (pos && out[pos - 1] == '}') {
+        snprintf(out + pos - 1, sizeof(out) - pos + 1, ",\"multi_controller\":%s,\"max_connected\":%u,\"slot\":%u,\"turbo_available\":%s,\"macros_available\":%s}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_slot_current(), bb_multi_mode() ? "false" : "true", bb_multi_mode() ? "false" : "true");
+    }
     send_ok(id, out);
 }
 
@@ -97,7 +101,7 @@ static void send_controllers(const char* id) {
         char display[BB_MAX_NAME];
         bb_controller_name_get(i, display, sizeof(display));
         bb_controller_kind_t kind = bb_controller_identify(c->native_vendor_id, c->native_product_id, c->name);
-        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"name\":\"%s\",\"model_name\":\"%s\",\"custom_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s}", i ? "," : "", i, (unsigned long)c->id, display, c->name, cfg.controller_names[i], (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, runtime.controller_connected && runtime.controller_index == i ? "true" : "false");
+        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"name\":\"%s\",\"model_name\":\"%s\",\"custom_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s,\"slot\":%d}", i ? "," : "", i, (unsigned long)c->id, display, c->name, cfg.controller_names[i], (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, bb_controller_slot(i) >= 0 ? "true" : "false", bb_controller_slot(i));
     }
     snprintf(out + pos, sizeof(out) - pos, "]}");
     send_ok(id, out);
@@ -224,7 +228,7 @@ static void handle_command(char* text) {
         bb_adapter_name_get(adapter_name, sizeof(adapter_name));
         bb_adapter_custom_name_get(custom_name, sizeof(custom_name));
         pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
         send_ok(id, out);
         return;
     }
@@ -251,6 +255,22 @@ static void handle_command(char* text) {
         char out[1024];
         if (offset < 0 || offset > 65535 || !bb_driver_hid_diagnostics((uint16_t)offset, out, sizeof(out))) send_err(id, "hid_offset");
         else send_ok(id, out);
+        return;
+    }
+    if (!strcmp(cmd, "MODE_GET")) {
+        char out[192];
+        snprintf(out, sizeof(out), "{\"multi_controller\":%s,\"max_connected\":%u,\"mister_only\":%s}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_multi_mode() ? "true" : "false");
+        send_ok(id, out);
+        return;
+    }
+    if (!strcmp(cmd, "MODE_SET")) {
+        char* value = next_field(&cursor);
+        if (!value || (strcmp(value, "0") && strcmp(value, "1"))) send_err(id, "controller_mode");
+        else { bb_multi_mode_set(value[0] == '1'); send_ok(id, "restarting"); }
+        return;
+    }
+    if (bb_multi_mode() && (!strcmp(cmd, "PROFILE_MACRO") || !strcmp(cmd, "PROFILE_TURBO_MODIFIER") || !strcmp(cmd, "PROFILE_TURBO_CONTROL") || !strcmp(cmd, "PROFILE_MAPPING_SEPARATE") || !strcmp(cmd, "PROFILE_MAPPING_SHARE") || !strcmp(cmd, "PROFILE_UNIQUE"))) {
+        send_err(id, "unavailable_in_multi_mode");
         return;
     }
     if (!strcmp(cmd, "STATUS")) {
@@ -494,7 +514,7 @@ static void handle_command(char* text) {
         char* size = next_field(&cursor);
         char* checksum = next_field(&cursor);
         int schema_value = schema ? atoi(schema) : 0;
-        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9 && schema_value != 10))) {
+        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11))) {
             import_active = false;
             send_err(id, "config_header");
             return;

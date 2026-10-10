@@ -47,6 +47,7 @@ target_link_libraries(mc_bluebridge PUBLIC
   pico_flash
   pico_unique_id
   hardware_flash
+  hardware_watchdog
   hardware_sync
   tinyusb_device
   tinyusb_board

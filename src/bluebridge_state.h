@@ -3,13 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLUEBRIDGE_VERSION "1.0.0-beta-56"
-#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=11"
+#define BLUEBRIDGE_VERSION "1.0.0-beta-57"
+#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=12"
 #define BLUEBRIDGE_PROTOCOL_VERSION 2
-#define BB_CONFIG_SCHEMA 11
+#define BB_CONFIG_SCHEMA 12
 #define BB_MAX_NAME 32
 #define BB_MAX_PROFILE_NAME 24
 #define BB_MAX_CONTROLLERS 8
+#define BB_MAX_SLOTS 4
 #define BB_MAX_PROFILES 8
 #define BB_BUTTON_COUNT 26
 #define BB_OUTPUT_BUTTON_COUNT 16
@@ -94,7 +95,17 @@ typedef struct __attribute__((packed)) {
     bb_controller_t controllers[BB_MAX_CONTROLLERS];
     char controller_names[BB_MAX_CONTROLLERS][BB_MAX_NAME];
     char adapter_name[BB_MAX_NAME];
+    uint8_t multi_controller;
+    uint8_t single_output_mode;
 } bb_config_t;
+
+#define BB_CONFIG_V11_SIZE offsetof(bb_config_t, multi_controller)
+bool bb_multi_mode(void);
+bool bb_multi_mode_set(bool enabled);
+uint8_t bb_slot_current(void);
+void bb_slot_enter(uint8_t slot);
+int bb_controller_slot(uint8_t controller);
+bool bb_mode_restart_pending(void);
 
 #define BB_CONFIG_V10_SIZE offsetof(bb_config_t, adapter_name)
 bool bb_adapter_rename(const char* name);
@@ -160,6 +171,7 @@ void bb_capture_stop(void);
 bool bb_capture_process(uint32_t buttons);
 void bb_capture_clear_result(void);
 void bb_state_get(bb_runtime_state_t* out);
+void bb_state_get_slot(uint8_t slot, bb_runtime_state_t* out);
 void bb_config_get(bb_config_t* out);
 void bb_active_profile_get(bb_profile_t* out);
 void bb_active_controller_get(bb_controller_t* out, uint8_t* active_index);
@@ -168,6 +180,7 @@ uint8_t bb_output_mode_value(void);
 void bb_config_set(const bb_config_t* cfg, bool persist);
 void bb_config_flush_pending(void);
 void bb_state_note_usb_report(bool sent);
+void bb_state_note_slot_usb_report(uint8_t slot, bool sent);
 bb_controller_t* bb_config_active_controller(bb_config_t* cfg);
 bb_profile_t* bb_config_active_profile(bb_config_t* cfg);
 const bb_controller_t* bb_config_active_controller_const(const bb_config_t* cfg);

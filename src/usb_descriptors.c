@@ -28,7 +28,9 @@ uint8_t const* tud_descriptor_device_cb(void) {
     device_desc.idVendor = 0x2E8A;
     device_desc.idProduct = 0x10B1;
     device_desc.bcdDevice = 0x0100;
-    if (mode == BB_OUTPUT_MISTER) {
+    if (bb_multi_mode()) {
+        device_desc.idProduct = 0x10B3;
+    } else if (mode == BB_OUTPUT_MISTER) {
         device_desc.idProduct = (uint16_t)(0xB000u | (bb_current_mister_identity() & 0x0fffu));
     } else if (mode == BB_OUTPUT_XINPUT) {
         device_desc.idVendor = 0x2E8A;
@@ -83,6 +85,16 @@ static const uint8_t mister_config_desc[] = {
     TUD_HID_DESCRIPTOR(COMPOSITE_ITF_GAMEPAD, 5, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x83, 16, 1)
 };
 
+#define MULTI_CONFIG_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + BB_MAX_SLOTS * TUD_HID_DESC_LEN)
+static const uint8_t multi_config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 6, 0, MULTI_CONFIG_LEN, 0, 100),
+    TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 64),
+    TUD_HID_DESCRIPTOR(2, 5, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x83, 64, 1),
+    TUD_HID_DESCRIPTOR(3, 6, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x84, 64, 1),
+    TUD_HID_DESCRIPTOR(4, 7, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x85, 64, 1),
+    TUD_HID_DESCRIPTOR(5, 8, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x86, 64, 1)
+};
+
 static const uint8_t switch_config_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 3, 0, SWITCH_CONFIG_LEN, 0x20, 500),
     TUD_HID_INOUT_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_NONE, sizeof(switch_report_desc), 0x01, 0x81, 64, 4),
@@ -99,6 +111,7 @@ static const uint8_t xinput_config_desc[] = {
 };
 
 uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
+    if (bb_multi_mode()) return multi_config_desc;
     (void)index;
     bb_output_mode_t mode = bb_output_mode();
     if (mode == BB_OUTPUT_MISTER) return mister_config_desc;
@@ -134,7 +147,10 @@ static const char* string_for_index(uint8_t index) {
             if (!serial_string[0]) pico_get_unique_board_id_string(serial_string, sizeof(serial_string));
             return serial_string;
         case 4: return "BlueBridge CDC";
-        case 5: return "BlueBridge Gamepad";
+        case 5: return bb_multi_mode() ? "BlueBridge Player 1" : "BlueBridge Gamepad";
+        case 6: return "BlueBridge Player 2";
+        case 7: return "BlueBridge Player 3";
+        case 8: return "BlueBridge Player 4";
         default: return NULL;
     }
 }

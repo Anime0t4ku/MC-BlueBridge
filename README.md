@@ -1,5 +1,16 @@
 # MC BlueBridge
 
+## Experimental multi-controller mode (beta-57)
+
+Single-controller mode remains the default. Companion Remote v4.0.4 adds a controller-mode selector to its BlueBridge page. Switching modes restarts the adapter and preserves its stored controllers and profiles.
+
+Multi-controller mode exposes four MiSTer USB gamepad interfaces under one fixed USB identity. Each connected controller uses its own active profile, button mappings, analog tuning and supported rumble. Turbo and macros are bypassed, with their saved settings preserved. Per-profile USB identities apply only in single-controller mode. The previously selected single-mode USB output is restored when multi mode is disabled.
+
+Use the controller selector to manage a connected controller. Pair controllers one at a time. Multi mode may increase input latency. Support for four simultaneous controllers is experimental and still requires hardware validation, including mixed Classic/BLE controllers, reconnects, MiSTer player assignment and simultaneous rumble.
+
+This source update has passed local behavior and syntax checks. A Pico SDK build and hardware verification have not been performed in this environment. No compiled UF2 is included. The separate BlueBridge site and Companion Desktop need subsequent updates for the mode controls and new USB PID `0x10B3`.
+
+
 MC BlueBridge is a Raspberry Pi Pico 2 W Bluetooth controller bridge and customization platform designed primarily for MiSTer.
 
 Bluetooth controllers connect to a Pico 2 W and are translated into a normalized BlueBridge controller state before profiles, mappings, and other behavior are applied. The normalized state is then emitted through the selected USB output driver. The supported output modes are MiSTer, X-Input, Generic HID, and Nintendo Switch.

@@ -1,5 +1,6 @@
 #include "hid_feedback.h"
 #include "bt_host.h"
+#include "bluebridge_state.h"
 #include <string.h>
 
 #define BB_EFFECT_COUNT 8
@@ -20,16 +21,36 @@ typedef struct {
     uint32_t started;
 } bb_effect_t;
 
-static bb_effect_t effects[BB_EFFECT_COUNT];
-static uint8_t device_gain = 255;
-static bool enabled = true;
-static bool paused;
-static uint32_t paused_at;
-static uint32_t clock_now;
-static uint32_t last_sent_at;
-static uint8_t last_strength;
-static uint8_t load_index;
-static uint8_t load_status = 3;
+typedef struct {
+    bb_effect_t effects[BB_EFFECT_COUNT];
+    uint8_t device_gain;
+    bool enabled;
+    bool paused;
+    uint32_t paused_at;
+    uint32_t clock_now;
+    uint32_t last_sent_at;
+    uint8_t last_strength;
+    uint8_t load_index;
+    uint8_t load_status;
+} bb_feedback_context_t;
+static bb_feedback_context_t feedback_slots[BB_MAX_SLOTS] = {
+{.device_gain=255,.enabled=true,.load_status=3},
+{.device_gain=255,.enabled=true,.load_status=3},
+{.device_gain=255,.enabled=true,.load_status=3},
+{.device_gain=255,.enabled=true,.load_status=3}
+};
+static uint8_t feedback_slot;
+void bb_feedback_select(uint8_t slot) { if (slot < BB_MAX_SLOTS) feedback_slot = slot; }
+#define effects (feedback_slots[feedback_slot].effects)
+#define device_gain (feedback_slots[feedback_slot].device_gain)
+#define enabled (feedback_slots[feedback_slot].enabled)
+#define paused (feedback_slots[feedback_slot].paused)
+#define paused_at (feedback_slots[feedback_slot].paused_at)
+#define clock_now (feedback_slots[feedback_slot].clock_now)
+#define last_sent_at (feedback_slots[feedback_slot].last_sent_at)
+#define last_strength (feedback_slots[feedback_slot].last_strength)
+#define load_index (feedback_slots[feedback_slot].load_index)
+#define load_status (feedback_slots[feedback_slot].load_status)
 
 static uint16_t read16(const uint8_t* p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -48,7 +69,7 @@ static unsigned available(void) {
 
 void bb_feedback_stop(void) {
     for (unsigned i = 0; i < BB_EFFECT_COUNT; ++i) effects[i].playing = false;
-    if (last_strength) bb_bt_host_set_output_rumble(0, 0);
+    if (last_strength) bb_bt_host_set_slot_rumble(feedback_slot, 0, 0);
     last_strength = 0;
     last_sent_at = clock_now;
 }
@@ -60,7 +81,7 @@ void bb_feedback_reset(void) {
     paused = false;
     load_index = 0;
     load_status = 3;
-    if (last_strength) bb_bt_host_set_output_rumble(0, 0);
+    if (last_strength) bb_bt_host_set_slot_rumble(feedback_slot, 0, 0);
     last_strength = 0;
     last_sent_at = clock_now;
 }
@@ -194,7 +215,7 @@ void bb_feedback_poll(uint32_t now) {
     }
     uint8_t strength = (uint8_t)peak;
     if (strength != last_strength || (strength && (uint32_t)(now - last_sent_at) >= 250u)) {
-        bb_bt_host_set_output_rumble(strength, strength);
+        bb_bt_host_set_slot_rumble(feedback_slot, strength, strength);
         last_strength = strength;
         last_sent_at = now;
     }

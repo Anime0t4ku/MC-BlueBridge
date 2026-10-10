@@ -84,6 +84,11 @@ void bb_input_submit(const bb_input_state_t* state) {
     }
     bb_profile_t profile;
     bb_active_profile_get(&profile);
+    if (bb_multi_mode()) {
+        profile.turbo_enabled = 0;
+        profile.turbo_rate_hz = 0;
+        memset(profile.macros, 0, sizeof(profile.macros));
+    }
     if (profile.id != last_profile_id || profile.turbo_enabled != last_turbo_enabled || profile.turbo_control_mode != last_turbo_mode || profile.turbo_control_button != last_turbo_button || profile.turbo_modifier != last_turbo_modifier) {
         last_profile_id = profile.id;
         last_turbo_enabled = profile.turbo_enabled;

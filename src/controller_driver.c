@@ -20,32 +20,66 @@
 #define HID_USAGE_HAT 0x39
 #define HID_USAGE_BATTERY_STRENGTH 0x20
 
-static uint8_t early_arcade_battery_report[2];
-static bool have_early_arcade_battery_report;
-static int16_t diagnostic_battery_request_status = -1;
-static uint32_t diagnostic_battery_request_count;
-static uint8_t diagnostic_battery_response[32];
-static uint8_t diagnostic_battery_response_length;
-static int16_t diagnostic_battery_status = -1;
-static uint8_t diagnostic_report[64];
-static uint16_t diagnostic_report_length;
-static uint16_t diagnostic_report_original_length;
-static uint32_t diagnostic_report_sequence;
-static bb_controller_identity_t identity;
-static const uint8_t* hid_descriptor;
-static uint16_t hid_descriptor_len;
-static bb_input_state_t last_input_state;
-static bool have_last_input_state;
-static bool pro2_home_pressed;
-static uint8_t eightbitdo_axis_roles[6];
-static bool eightbitdo_axis_roles_ready;
-static uint32_t switch2_cal_sum[4];
-static uint16_t switch2_cal_center[4];
-static uint8_t switch2_cal_samples;
-static uint8_t gamecube_trigger_rest[2] = {255, 255};
-static uint16_t n64_center[2] = {2048, 2048};
-static uint16_t n64_below[2] = {2047, 2047};
-static uint16_t n64_above[2] = {2047, 2047};
+typedef struct {
+    uint8_t early_arcade_battery_report[2];
+    bool have_early_arcade_battery_report;
+    int16_t diagnostic_battery_request_status;
+    uint32_t diagnostic_battery_request_count;
+    uint8_t diagnostic_battery_response[32];
+    uint8_t diagnostic_battery_response_length;
+    int16_t diagnostic_battery_status;
+    uint8_t diagnostic_report[64];
+    uint16_t diagnostic_report_length;
+    uint16_t diagnostic_report_original_length;
+    uint32_t diagnostic_report_sequence;
+    bb_controller_identity_t identity;
+    const uint8_t* hid_descriptor;
+    uint16_t hid_descriptor_len;
+    bb_input_state_t last_input_state;
+    bool have_last_input_state;
+    bool pro2_home_pressed;
+    uint8_t eightbitdo_axis_roles[6];
+    bool eightbitdo_axis_roles_ready;
+    uint32_t switch2_cal_sum[4];
+    uint16_t switch2_cal_center[4];
+    uint8_t switch2_cal_samples;
+    uint8_t gamecube_trigger_rest[2];
+    uint16_t n64_center[2];
+    uint16_t n64_below[2];
+    uint16_t n64_above[2];
+} bb_driver_context_t;
+static bb_driver_context_t driver_slots[BB_MAX_SLOTS] = {
+{.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}},
+{.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}},
+{.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}},
+{.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}}
+};
+#define early_arcade_battery_report (driver_slots[bb_slot_current()].early_arcade_battery_report)
+#define have_early_arcade_battery_report (driver_slots[bb_slot_current()].have_early_arcade_battery_report)
+#define diagnostic_battery_request_status (driver_slots[bb_slot_current()].diagnostic_battery_request_status)
+#define diagnostic_battery_request_count (driver_slots[bb_slot_current()].diagnostic_battery_request_count)
+#define diagnostic_battery_response (driver_slots[bb_slot_current()].diagnostic_battery_response)
+#define diagnostic_battery_response_length (driver_slots[bb_slot_current()].diagnostic_battery_response_length)
+#define diagnostic_battery_status (driver_slots[bb_slot_current()].diagnostic_battery_status)
+#define diagnostic_report (driver_slots[bb_slot_current()].diagnostic_report)
+#define diagnostic_report_length (driver_slots[bb_slot_current()].diagnostic_report_length)
+#define diagnostic_report_original_length (driver_slots[bb_slot_current()].diagnostic_report_original_length)
+#define diagnostic_report_sequence (driver_slots[bb_slot_current()].diagnostic_report_sequence)
+#define identity (driver_slots[bb_slot_current()].identity)
+#define hid_descriptor (driver_slots[bb_slot_current()].hid_descriptor)
+#define hid_descriptor_len (driver_slots[bb_slot_current()].hid_descriptor_len)
+#define last_input_state (driver_slots[bb_slot_current()].last_input_state)
+#define have_last_input_state (driver_slots[bb_slot_current()].have_last_input_state)
+#define pro2_home_pressed (driver_slots[bb_slot_current()].pro2_home_pressed)
+#define eightbitdo_axis_roles (driver_slots[bb_slot_current()].eightbitdo_axis_roles)
+#define eightbitdo_axis_roles_ready (driver_slots[bb_slot_current()].eightbitdo_axis_roles_ready)
+#define switch2_cal_sum (driver_slots[bb_slot_current()].switch2_cal_sum)
+#define switch2_cal_center (driver_slots[bb_slot_current()].switch2_cal_center)
+#define switch2_cal_samples (driver_slots[bb_slot_current()].switch2_cal_samples)
+#define gamecube_trigger_rest (driver_slots[bb_slot_current()].gamecube_trigger_rest)
+#define n64_center (driver_slots[bb_slot_current()].n64_center)
+#define n64_below (driver_slots[bb_slot_current()].n64_below)
+#define n64_above (driver_slots[bb_slot_current()].n64_above)
 
 static void submit_state(const bb_input_state_t* state) {
     if (!state) return;
