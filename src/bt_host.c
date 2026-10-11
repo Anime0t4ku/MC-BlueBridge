@@ -44,6 +44,7 @@ static uint8_t host_att_appearance[] = {0x80, 0x00};
 static uint8_t host_service_changed_range[] = {0x01, 0x00, 0xff, 0xff};
 static bool stack_ready;
 static bool scanning;
+static bool scan_busy;
 static bool pairing;
 static bool classic_inquiry_active;
 static uint32_t classic_inquiry_retry_at;
@@ -51,18 +52,10 @@ static bb_config_t remembered_cfg;
 static btstack_timer_source_t usb_watch_timer;
 static bool usb_was_ready;
 static uint32_t usb_lost_since;
-static uint32_t multi_reconnect_at;
-static uint8_t classic_reconnect_cursor;
 static uint32_t discovery_started_at;
 static bool discovery_window_active;
-typedef struct {
-    bd_addr_t address;
-    uint32_t retry_at;
-    uint8_t failures;
-    bool used;
-} bb_reconnect_retry_t;
-static bb_reconnect_retry_t reconnect_retries[BB_MAX_CONTROLLERS];
-static uint8_t reconnect_retry_cursor;
+static bool connection_settle_active;
+static uint32_t connection_settle_started;
 static bool ble_address_lookup_pending;
 static bd_addr_t ble_address_lookup_addr;
 static uint8_t ble_address_lookup_type;
@@ -72,6 +65,15 @@ typedef struct {
     bool classic_attempt_active;
     hci_con_handle_t pending_classic_handle;
     uint32_t classic_generation;
+    bool disconnect_cleanup_active;
+    hci_con_handle_t closing_handle;
+    uint8_t classic_report_storage[2][128];
+    uint8_t classic_report_bank;
+    bool classic_setup_pending;
+    uint32_t classic_setup_started;
+    bool dualsense_activation_pending;
+    uint8_t dualsense_activation_attempts;
+    uint32_t dualsense_activation_at;
     uint32_t identity_query_generation;
     bool identity_query_pending;
     bool identity_query_active;
@@ -155,17 +157,14 @@ typedef struct {
     uint8_t wiiu_setup_step;
     uint32_t wiiu_setup_at;
     uint32_t rumble_stop_at;
-    uint32_t classic_reconnect_at;
     uint32_t rumble_refresh_at;
     uint8_t rumble_active_strength;
     uint8_t switch2_rumble_seq;
     uint32_t last_controller_report_at;
 } bb_host_context_t;
 static bb_host_context_t host_slots[BB_MAX_SLOTS] = {
-{.pending_classic_handle = HCI_CON_HANDLE_INVALID,.classic_handle = HCI_CON_HANDLE_INVALID,.le_handle = HCI_CON_HANDLE_INVALID,.ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY,.ble_stage = "idle",.ble_failed_stage = "none",.ble_setup_status = -1,.ble_pairing_reason = -1,.ble_key_minimum = 7,.ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION,.current_controller_index = -1},
-{.pending_classic_handle = HCI_CON_HANDLE_INVALID,.classic_handle = HCI_CON_HANDLE_INVALID,.le_handle = HCI_CON_HANDLE_INVALID,.ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY,.ble_stage = "idle",.ble_failed_stage = "none",.ble_setup_status = -1,.ble_pairing_reason = -1,.ble_key_minimum = 7,.ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION,.current_controller_index = -1},
-{.pending_classic_handle = HCI_CON_HANDLE_INVALID,.classic_handle = HCI_CON_HANDLE_INVALID,.le_handle = HCI_CON_HANDLE_INVALID,.ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY,.ble_stage = "idle",.ble_failed_stage = "none",.ble_setup_status = -1,.ble_pairing_reason = -1,.ble_key_minimum = 7,.ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION,.current_controller_index = -1},
-{.pending_classic_handle = HCI_CON_HANDLE_INVALID,.classic_handle = HCI_CON_HANDLE_INVALID,.le_handle = HCI_CON_HANDLE_INVALID,.ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY,.ble_stage = "idle",.ble_failed_stage = "none",.ble_setup_status = -1,.ble_pairing_reason = -1,.ble_key_minimum = 7,.ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION,.current_controller_index = -1}
+{.closing_handle = HCI_CON_HANDLE_INVALID,.pending_classic_handle = HCI_CON_HANDLE_INVALID,.classic_handle = HCI_CON_HANDLE_INVALID,.le_handle = HCI_CON_HANDLE_INVALID,.ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY,.ble_stage = "idle",.ble_failed_stage = "none",.ble_setup_status = -1,.ble_pairing_reason = -1,.ble_key_minimum = 7,.ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION,.current_controller_index = -1},
+{.closing_handle = HCI_CON_HANDLE_INVALID,.pending_classic_handle = HCI_CON_HANDLE_INVALID,.classic_handle = HCI_CON_HANDLE_INVALID,.le_handle = HCI_CON_HANDLE_INVALID,.ble_secure_connections_only = BB_SM_DEFAULT_SC_ONLY,.ble_stage = "idle",.ble_failed_stage = "none",.ble_setup_status = -1,.ble_pairing_reason = -1,.ble_key_minimum = 7,.ble_authentication = SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION,.current_controller_index = -1}
 };
 typedef struct {
     bd_addr_t addr;
@@ -184,7 +183,7 @@ static const uint8_t nintendo_gc_uuid[16] = {0x82,0x61,0xcb,0xa1,0x94,0x35,0x42,
 static int slot_for_handle(uint16_t handle) {
     if (handle == HCI_CON_HANDLE_INVALID) return -1;
     for (int i = 0; i < BB_MAX_SLOTS; ++i) {
-        if (host_slots[i].le_handle == handle || host_slots[i].classic_handle == handle || host_slots[i].pending_classic_handle == handle) return i;
+        if (host_slots[i].le_handle == handle || host_slots[i].classic_handle == handle || host_slots[i].pending_classic_handle == handle || host_slots[i].closing_handle == handle) return i;
     }
     return -1;
 }
@@ -200,7 +199,7 @@ static int slot_for_address_except(const uint8_t addr[6], int excluded) {
     for (int i = 0; i < BB_MAX_SLOTS; ++i) {
         if (i == excluded) continue;
         bb_host_context_t* c = &host_slots[i];
-        if (((c->classic_hid_cid || c->classic_handle != HCI_CON_HANDLE_INVALID || c->le_handle != HCI_CON_HANDLE_INVALID) && (!memcmp(c->current_identity.address, addr, 6) || !memcmp(c->pending_addr, addr, 6))) ||
+        if (((c->classic_hid_cid || c->classic_handle != HCI_CON_HANDLE_INVALID || c->le_handle != HCI_CON_HANDLE_INVALID || c->closing_handle != HCI_CON_HANDLE_INVALID) && (!memcmp(c->current_identity.address, addr, 6) || !memcmp(c->pending_addr, addr, 6))) ||
             ((c->classic_connecting || c->ble_connecting) && !memcmp(c->pending_addr, addr, 6))) return i;
     }
     return -1;
@@ -210,16 +209,36 @@ static int slot_for_address(const uint8_t addr[6]) {
 }
 static bool any_setup(void) {
     for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
-        if (host_slots[i].classic_connecting || host_slots[i].ble_connecting) return true;
+        if (host_slots[i].classic_connecting || host_slots[i].ble_connecting || host_slots[i].classic_setup_pending) return true;
+    }
+    return false;
+}
+static bool ble_setup_elsewhere(uint8_t owner) {
+    for (uint8_t i = 0; i < BB_MAX_SLOTS; ++i) {
+        if (i != owner && host_slots[i].ble_connecting) return true;
     }
     return false;
 }
 static int free_slot(void) {
     for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_host_context_t* c = &host_slots[i];
-        if (c->current_controller_index < 0 && !c->classic_connecting && !c->ble_connecting && !c->classic_hid_cid && c->classic_handle == HCI_CON_HANDLE_INVALID && c->pending_classic_handle == HCI_CON_HANDLE_INVALID && c->le_handle == HCI_CON_HANDLE_INVALID) return i;
+        if (c->current_controller_index < 0 && !c->classic_connecting && !c->ble_connecting && !c->classic_hid_cid && c->classic_handle == HCI_CON_HANDLE_INVALID && c->pending_classic_handle == HCI_CON_HANDLE_INVALID && c->le_handle == HCI_CON_HANDLE_INVALID && c->closing_handle == HCI_CON_HANDLE_INVALID) return i;
     }
     return -1;
+}
+static bool connected_controller_present(void) {
+    for (int i = 0; i < BB_MAX_SLOTS; ++i) {
+        if (host_slots[i].current_controller_index >= 0) return true;
+    }
+    return false;
+}
+static bool multi_discovery_paused(uint32_t now) {
+    if (!bb_multi_mode() || pairing || !connection_settle_active) return false;
+    if (!connected_controller_present() || (uint32_t)(now - connection_settle_started) >= 1500u) {
+        connection_settle_active = false;
+        return false;
+    }
+    return true;
 }
 static int route_hci(const uint8_t* packet, uint16_t size) {
     if (!bb_multi_mode()) return 0;
@@ -270,6 +289,13 @@ static int route_hci(const uint8_t* packet, uint16_t size) {
     return known >= 0 ? known : free_slot();
 }
 
+static bool same_address(const uint8_t a[6], const uint8_t b[6]);
+static bool remembered_address(const uint8_t addr[6]);
+static int classic_connection_filter(bd_addr_t addr, hci_link_type_t link_type) {
+    if (link_type != HCI_LINK_TYPE_ACL) return 1;
+    return free_slot() >= 0 && (pairing || remembered_address(addr));
+}
+
 bool bb_bt_host_diagnostics(char* out, size_t size) {
     return bb_bt_host_diagnostics_slot(bb_slot_current(), out, size);
 }
@@ -308,6 +334,15 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
 #define classic_attempt_started (host_slots[bb_slot_current()].classic_attempt_started)
 #define classic_attempt_active (host_slots[bb_slot_current()].classic_attempt_active)
 #define pending_classic_handle (host_slots[bb_slot_current()].pending_classic_handle)
+#define classic_report_storage (host_slots[bb_slot_current()].classic_report_storage)
+#define classic_report_bank (host_slots[bb_slot_current()].classic_report_bank)
+#define classic_setup_pending (host_slots[bb_slot_current()].classic_setup_pending)
+#define classic_setup_started (host_slots[bb_slot_current()].classic_setup_started)
+#define dualsense_activation_pending (host_slots[bb_slot_current()].dualsense_activation_pending)
+#define dualsense_activation_attempts (host_slots[bb_slot_current()].dualsense_activation_attempts)
+#define dualsense_activation_at (host_slots[bb_slot_current()].dualsense_activation_at)
+#define closing_handle (host_slots[bb_slot_current()].closing_handle)
+#define disconnect_cleanup_active (host_slots[bb_slot_current()].disconnect_cleanup_active)
 #define classic_generation (host_slots[bb_slot_current()].classic_generation)
 #define identity_query_generation (host_slots[bb_slot_current()].identity_query_generation)
 #define identity_query_pending (host_slots[bb_slot_current()].identity_query_pending)
@@ -392,7 +427,6 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
 #define wiiu_setup_step (host_slots[bb_slot_current()].wiiu_setup_step)
 #define wiiu_setup_at (host_slots[bb_slot_current()].wiiu_setup_at)
 #define rumble_stop_at (host_slots[bb_slot_current()].rumble_stop_at)
-#define classic_reconnect_at (host_slots[bb_slot_current()].classic_reconnect_at)
 #define rumble_refresh_at (host_slots[bb_slot_current()].rumble_refresh_at)
 #define rumble_active_strength (host_slots[bb_slot_current()].rumble_active_strength)
 #define switch2_rumble_seq (host_slots[bb_slot_current()].switch2_rumble_seq)
@@ -403,12 +437,53 @@ static void start_scans(void);
 static void start_classic_inquiry(void);
 static void stop_scans(void);
 static bool name_has(const char* name, const char* part);
-static void schedule_classic_reconnect(uint32_t delay_ms);
 static void reset_classic_name_candidates(void);
 static void request_next_classic_name(void);
 
 static bool connection_in_progress(void) {
     return any_setup() || classic_name_request_active;
+}
+
+static uint8_t send_classic_report(uint16_t cid, uint16_t report_id, const uint8_t* report, uint16_t length) {
+    if (!cid || cid != classic_hid_cid || !report || length > sizeof(classic_report_storage[0])) return ERROR_CODE_COMMAND_DISALLOWED;
+    uint8_t bank = classic_report_bank ^ 1u;
+    memcpy(classic_report_storage[bank], report, length);
+    uint8_t status = hid_host_send_report(cid, report_id, classic_report_storage[bank], length);
+    if (status == ERROR_CODE_SUCCESS) classic_report_bank = bank;
+    return status;
+}
+static uint8_t send_classic_set_report(uint16_t cid, hid_report_type_t type, uint16_t report_id, const uint8_t* report, uint8_t length) {
+    if (!cid || cid != classic_hid_cid || !report || length > sizeof(classic_report_storage[0])) return ERROR_CODE_COMMAND_DISALLOWED;
+    uint8_t bank = classic_report_bank ^ 1u;
+    memcpy(classic_report_storage[bank], report, length);
+    uint8_t status = hid_host_send_set_report(cid, type, report_id, classic_report_storage[bank], length);
+    if (status == ERROR_CODE_SUCCESS) classic_report_bank = bank;
+    return status;
+}
+static void finish_classic_setup(void) {
+    if (!classic_setup_pending) return;
+    classic_setup_pending = false;
+    if (bb_multi_mode()) {
+        connection_settle_started = btstack_run_loop_get_time_ms();
+        connection_settle_active = true;
+    }
+}
+static void controller_disconnected(bool link_closed);
+static void service_classic_setup(uint32_t now) {
+    if (classic_setup_pending && (uint32_t)(now - classic_setup_started) >= 15000u) controller_disconnected(false);
+}
+static void service_dualsense_activation(uint32_t now) {
+    if (!dualsense_activation_pending) return;
+    if (!classic_hid_cid || closing_handle != HCI_CON_HANDLE_INVALID || manual_disconnect_pending ||
+        (current_identity.kind != BB_CONTROLLER_DUALSENSE && current_identity.kind != BB_CONTROLLER_DUALSENSE_EDGE)) {
+        dualsense_activation_pending = false;
+        return;
+    }
+    if ((int32_t)(now - dualsense_activation_at) < 0) return;
+    uint8_t status = hid_host_send_get_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x05);
+    ++dualsense_activation_attempts;
+    dualsense_activation_pending = status == ERROR_CODE_COMMAND_DISALLOWED && dualsense_activation_attempts < 10;
+    dualsense_activation_at = now + 100u;
 }
 
 static uint32_t seeded_crc(uint8_t seed, const uint8_t* report, uint16_t length) {
@@ -437,7 +512,7 @@ static bool send_dualsense_power_off(void) {
     report[44] = (uint8_t)(crc >> 8);
     report[45] = (uint8_t)(crc >> 16);
     report[46] = (uint8_t)(crc >> 24);
-    return hid_host_send_set_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x08, &report[1], 46) == ERROR_CODE_SUCCESS;
+    return send_classic_set_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x08, &report[1], 46) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_dualsense_rumble(uint8_t strength) {
@@ -457,7 +532,7 @@ static bool send_dualsense_rumble(uint8_t strength) {
     report[75] = (uint8_t)(crc >> 8);
     report[76] = (uint8_t)(crc >> 16);
     report[77] = (uint8_t)(crc >> 24);
-    return hid_host_send_report(classic_hid_cid, 0x31, &report[1], 77) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x31, &report[1], 77) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_switch_report_mode(uint8_t mode) {
@@ -472,7 +547,7 @@ static bool send_switch_report_mode(uint8_t mode) {
     payload[8] = 0x40;
     payload[9] = 0x03;
     payload[10] = mode;
-    return hid_host_send_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_ds4_rumble(uint8_t strength) {
@@ -490,13 +565,13 @@ static bool send_ds4_rumble(uint8_t strength) {
     report[75] = (uint8_t)(crc >> 8);
     report[76] = (uint8_t)(crc >> 16);
     report[77] = (uint8_t)(crc >> 24);
-    return hid_host_send_report(classic_hid_cid, 0x11, &report[1], 77) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x11, &report[1], 77) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_ds3_activation(void) {
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK3) return false;
     uint8_t payload[4] = {0x42, 0x03, 0x00, 0x00};
-    return hid_host_send_set_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0xf4, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_set_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0xf4, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_ds3_rumble(uint8_t strength) {
@@ -515,7 +590,7 @@ static bool send_ds3_rumble(uint8_t strength) {
         report[o + 2] = 0x10;
         report[o + 4] = 0x32;
     }
-    return hid_host_send_report(classic_hid_cid, 0x01, &report[1], 35) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x01, &report[1], 35) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_switch_subcommand(uint8_t subcommand, uint8_t value) {
@@ -533,7 +608,7 @@ static bool send_switch_subcommand(uint8_t subcommand, uint8_t value) {
     payload[8] = 0x40;
     payload[9] = subcommand;
     payload[10] = value;
-    return hid_host_send_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_n64_calibration_read(bool user) {
@@ -545,7 +620,7 @@ static bool send_n64_calibration_read(bool user) {
     payload[10] = user ? 0x10 : 0x3d;
     payload[11] = user ? 0x80 : 0x60;
     payload[14] = user ? 11 : 9;
-    return hid_host_send_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x01, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static void switch_setup_begin(void) {
@@ -642,7 +717,7 @@ static bool send_switch_rumble(uint8_t strength) {
     payload[6] = 0x01;
     payload[7] = 0x40;
     payload[8] = amp;
-    return hid_host_send_report(classic_hid_cid, 0x10, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x10, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static bool eightbitdo64_ble_connected(void) {
@@ -675,7 +750,7 @@ static bool send_8bitdo_dinput_rumble(uint8_t strength) {
     if (eightbitdo64_ble_connected()) return send_8bitdo64_ble_rumble(strength);
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_8BITDO || classic_switch_protocol) return false;
     uint8_t payload[4] = {strength, strength, 0, 0};
-    return hid_host_send_report(classic_hid_cid, 0x05, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x05, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static void switch2_rumble_frame(uint8_t strength, uint8_t out[5]) {
@@ -705,19 +780,19 @@ static bool send_wiiu_write(uint32_t address, uint8_t value) {
     payload[3] = (uint8_t)address;
     payload[4] = 1;
     payload[5] = value;
-    return hid_host_send_report(classic_hid_cid, 0x16, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x16, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_wiiu_report_mode(void) {
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_WII_U_PRO) return false;
     uint8_t payload[2] = {0x04, 0x34};
-    return hid_host_send_report(classic_hid_cid, 0x12, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x12, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
 static bool send_wiiu_rumble(uint8_t strength) {
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_WII_U_PRO) return false;
     uint8_t payload = strength ? 0x01 : 0x00;
-    return hid_host_send_report(classic_hid_cid, 0x10, &payload, 1) == ERROR_CODE_SUCCESS;
+    return send_classic_report(classic_hid_cid, 0x10, &payload, 1) == ERROR_CODE_SUCCESS;
 }
 
 static bool xbox_ble_connected(void) {
@@ -836,11 +911,6 @@ static bool remembered_address(const uint8_t addr[6]) {
     return false;
 }
 
-static int classic_connection_filter(bd_addr_t addr, hci_link_type_t link_type) {
-    if (link_type != HCI_LINK_TYPE_ACL) return 1;
-    return pairing || remembered_address(addr);
-}
-
 static bool name_has(const char* name, const char* part);
 
 static const char* remembered_name(const uint8_t addr[6]) {
@@ -849,66 +919,6 @@ static const char* remembered_name(const uint8_t addr[6]) {
         if (same_address(remembered_cfg.controllers[i].bluetooth_address, addr)) return remembered_cfg.controllers[i].name;
     }
     return NULL;
-}
-
-static bb_reconnect_retry_t* reconnect_retry(const uint8_t address[6], bool create) {
-    for (uint8_t i = 0; i < BB_MAX_CONTROLLERS; ++i) {
-        if (reconnect_retries[i].used && same_address(reconnect_retries[i].address, address)) return &reconnect_retries[i];
-    }
-    if (!create) return NULL;
-    uint8_t selected = reconnect_retry_cursor;
-    for (uint8_t i = 0; i < BB_MAX_CONTROLLERS; ++i) {
-        if (!reconnect_retries[i].used) { selected = i; break; }
-    }
-    bb_reconnect_retry_t* retry = &reconnect_retries[selected];
-    memset(retry, 0, sizeof(*retry));
-    memcpy(retry->address, address, 6);
-    retry->used = true;
-    reconnect_retry_cursor = (uint8_t)((selected + 1) % BB_MAX_CONTROLLERS);
-    return retry;
-}
-
-static bool reconnect_retry_ready(const uint8_t address[6], uint32_t now) {
-    bb_reconnect_retry_t* retry = reconnect_retry(address, false);
-    return !retry || (int32_t)(now - retry->retry_at) >= 0;
-}
-
-static void reconnect_retry_started(const uint8_t address[6]) {
-    if (!bb_multi_mode() || pairing) return;
-    bb_reconnect_retry_t* retry = reconnect_retry(address, true);
-    if (retry->failures < 5) ++retry->failures;
-    uint32_t delay = 5000u << (retry->failures - 1);
-    if (delay > 60000u) delay = 60000u;
-    retry->retry_at = btstack_run_loop_get_time_ms() + delay;
-}
-
-static void reconnect_retry_succeeded(const uint8_t address[6]) {
-    bb_reconnect_retry_t* retry = reconnect_retry(address, false);
-    if (retry) memset(retry, 0, sizeof(*retry));
-}
-
-static bool classic_reconnect_target(bd_addr_t addr, char* name, size_t name_size) {
-    bb_config_get(&remembered_cfg);
-    if (!remembered_cfg.controller_count || remembered_cfg.active_controller >= remembered_cfg.controller_count) return false;
-    for (uint8_t i = 0; i < remembered_cfg.controller_count; ++i) {
-        uint8_t index = (uint8_t)((classic_reconnect_cursor + i) % remembered_cfg.controller_count);
-        const bb_controller_t* controller = &remembered_cfg.controllers[index];
-        if (slot_for_address(controller->bluetooth_address) >= 0 || reconnect_blocked(controller->bluetooth_address)) continue;
-        if (bb_multi_mode() && !reconnect_retry_ready(controller->bluetooth_address, btstack_run_loop_get_time_ms())) continue;
-        if (controller->native_vendor_id == 0x054c || name_has(controller->name, "dualsense") || name_has(controller->name, "wireless controller") || name_has(controller->name, "dualshock")) continue;
-        link_key_t key;
-        link_key_type_t type;
-        memcpy(addr, controller->bluetooth_address, 6);
-        if (!gap_get_link_key_for_bd_addr(addr, key, &type)) continue;
-        classic_reconnect_cursor = (uint8_t)(index + 1);
-        copy_name(name, name_size, controller->name);
-        return true;
-    }
-    return false;
-}
-
-static void schedule_classic_reconnect(uint32_t delay_ms) {
-    classic_reconnect_at = btstack_run_loop_get_time_ms() + delay_ms;
 }
 
 static bool name_has(const char* name, const char* part) {
@@ -1171,29 +1181,56 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     classic_attempt_active = false;
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
     ble_connecting = false;
-    reconnect_retry_succeeded(current_identity.address);
     if (le_handle != HCI_CON_HANDLE_INVALID) ble_stage = "active";
-    classic_reconnect_at = 0;
 
     gap_discoverable_control(1);
     scanning = false;
     last_controller_report_at = btstack_run_loop_get_time_ms();
     if (!bb_multi_mode() && bb_output_mode() == BB_OUTPUT_MISTER && old_identity != bb_current_mister_identity()) bb_usb_request_reenumeration();
-    if (bb_multi_mode()) { start_scans(); schedule_classic_reconnect(3000u); }
+    if (bb_multi_mode()) {
+        connection_settle_started = btstack_run_loop_get_time_ms();
+        connection_settle_active = true;
+        start_scans();
+    }
 }
 
-static void controller_disconnected(void) {
+static void retire_controller_link(bool link_closed) {
+    hci_con_handle_t handle = le_handle != HCI_CON_HANDLE_INVALID ? le_handle :
+        classic_handle != HCI_CON_HANDLE_INVALID ? classic_handle : pending_classic_handle;
+    if (!link_closed && handle != HCI_CON_HANDLE_INVALID && gap_get_connection_type(handle) != GAP_CONNECTION_INVALID) {
+        closing_handle = handle;
+        gap_disconnect(handle);
+    }
+}
+static bool release_closing_handle(hci_con_handle_t handle) {
+    if (handle == HCI_CON_HANDLE_INVALID || handle != closing_handle) return false;
+    closing_handle = HCI_CON_HANDLE_INVALID;
+    return true;
+}
+
+static void controller_disconnected(bool link_closed) {
+    if (disconnect_cleanup_active) return;
+    if (le_handle == HCI_CON_HANDLE_INVALID && classic_handle == HCI_CON_HANDLE_INVALID &&
+        pending_classic_handle == HCI_CON_HANDLE_INVALID && !hids_cid && !classic_hid_cid &&
+        !xbox_battery_cid && !ble_connecting && !classic_connecting && !classic_attempt_active &&
+        current_controller_index < 0) return;
+    disconnect_cleanup_active = true;
+    bool owned_classic_setup = classic_connecting || classic_attempt_active;
+    bool other_ble_setup = ble_setup_elsewhere(bb_slot_current());
+    retire_controller_link(link_closed);
     uint16_t battery_cid = xbox_battery_cid;
     xbox_battery_cid = 0;
-    if (battery_cid) battery_service_client_disconnect(battery_cid);
     classic_generation++;
+    classic_setup_pending = false;
+    dualsense_activation_pending = false;
+    dualsense_activation_attempts = 0;
     ds4_descriptor_ready = false;
     ds4_activation_pending = false;
     ds4_activation_step = 0;
     arcade_battery_poll_at = 0;
     identity_query_pending = false;
     connected_name_request = false;
-    reset_classic_name_candidates();
+    if (owned_classic_setup) reset_classic_name_candidates();
     bb_input_state_t neutral;
     bb_input_clear(&neutral);
     bb_input_submit(&neutral);
@@ -1211,9 +1248,11 @@ static void controller_disconnected(void) {
     ble_security_retry_pending = ble_security_retry_pending && pairing && !manual_disconnect_pending;
     if (le_custom_nintendo) gatt_client_stop_listening_for_characteristic_value_updates(&nintendo_listener);
     host_service_changed_ccc = 0;
-    sm_set_encryption_key_size_range(7, 16);
-    sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
-    if (ble_security_retry) sm_set_secure_connections_only_mode(BB_SM_DEFAULT_SC_ONLY);
+    if (!other_ble_setup) {
+        sm_set_encryption_key_size_range(7, 16);
+        sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
+        if (ble_security_retry) sm_set_secure_connections_only_mode(BB_SM_DEFAULT_SC_ONLY);
+    }
     ble_setup_started = false;
     if (!strcmp(ble_failed_stage, "none")) ble_stage = "disconnected";
     le_custom_nintendo = false;
@@ -1222,6 +1261,7 @@ static void controller_disconnected(void) {
     classic_hid_cid = 0;
     classic_handle = HCI_CON_HANDLE_INVALID;
     hids_cid = 0;
+    if (battery_cid) battery_service_client_disconnect(battery_cid);
     xbox_rumble_write_pending = false;
     xbox_rumble_retry = false;
     eightbitdo64_rumble_write_pending = false;
@@ -1244,9 +1284,9 @@ static void controller_disconnected(void) {
     rumble_active_strength = 0;
     switch2_rumble_seq = 0;
     last_controller_report_at = 0;
+    disconnect_cleanup_active = false;
     if (stack_ready) {
         if (!ble_security_retry_pending) start_scans();
-        schedule_classic_reconnect(3000u);
     }
 }
 
@@ -1261,7 +1301,10 @@ static void start_classic_inquiry(void) {
 }
 
 static void start_scans(void) {
+    if (multi_discovery_paused(btstack_run_loop_get_time_ms())) return;
     if (!stack_ready || connection_in_progress() || free_slot() < 0) return;
+    bool busy = bb_multi_mode() && connected_controller_present();
+    if (scanning && scan_busy != busy) stop_scans();
     if (!scanning) {
         scanning = true;
         if (bb_multi_mode()) {
@@ -1269,7 +1312,8 @@ static void start_scans(void) {
             discovery_window_active = true;
         }
         bb_state_set_scanning(true);
-        gap_set_scan_parameters(1, 48, 48);
+        scan_busy = busy;
+        gap_set_scan_parameters(1, busy ? 96 : 48, busy ? 24 : 48);
         gap_start_scan();
     }
     start_classic_inquiry();
@@ -1288,9 +1332,9 @@ static void stop_scans(void) {
 }
 
 static void connect_classic(const uint8_t addr[6], const char* name) {
-    if (classic_connecting || ble_connecting) return;
+    if (multi_discovery_paused(btstack_run_loop_get_time_ms())) return;
+    if (classic_connecting || ble_connecting || free_slot() < 0) return;
     reset_classic_name_candidates();
-    classic_reconnect_at = 0;
     classic_connecting = true;
     classic_attempt_active = true;
     classic_attempt_started = btstack_run_loop_get_time_ms();
@@ -1300,14 +1344,12 @@ static void connect_classic(const uint8_t addr[6], const char* name) {
     copy_name(pending_name, sizeof(pending_name), name);
     pending_vid = 0;
     pending_pid = 0;
-    reconnect_retry_started(pending_addr);
     gap_set_page_timeout(bb_multi_mode() && !pairing ? 4800u : 0x6000u);
     uint8_t status = hid_host_connect(pending_addr, HID_PROTOCOL_MODE_REPORT, &classic_hid_cid);
     if (status != ERROR_CODE_SUCCESS) {
         classic_connecting = false;
         classic_attempt_active = false;
         start_scans();
-        if (!pairing) schedule_classic_reconnect(20000u);
     }
 }
 
@@ -1322,7 +1364,8 @@ static void configure_ble_security(void) {
 
 static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const char* name, bool custom_nintendo, bool gamecube, uint16_t vid, uint16_t pid) {
     const char* resolved_name = name && name[0] ? name : remembered_name(addr);
-    if (connection_in_progress()) return;
+    if (multi_discovery_paused(btstack_run_loop_get_time_ms())) return;
+    if (connection_in_progress() || slot_for_address(addr) >= 0 || free_slot() < 0) return;
     ble_connecting = true;
     ble_attempt_started = btstack_run_loop_get_time_ms();
     ble_setup_started = false;
@@ -1400,7 +1443,8 @@ static void enable_nintendo_notifications(void) {
 static void xbox_battery_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void xbox_battery_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 5 ? slot_for_cid(little_endian_read_16(packet, 3), 2) : -1) : 0;
+    if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || size < 5 || packet[0] != HCI_EVENT_GATTSERVICE_META) return;
+    int slot = slot_for_cid(little_endian_read_16(packet, 3), 2);
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     xbox_battery_handler_impl(packet_type, channel, packet, size);
@@ -1444,7 +1488,8 @@ static void ble_setup_fail(uint8_t status);
 static void hids_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void hids_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 5 ? slot_for_cid(little_endian_read_16(packet, 3), 1) : -1) : 0;
+    if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || size < 5 || packet[0] != HCI_EVENT_GATTSERVICE_META) return;
+    int slot = slot_for_cid(little_endian_read_16(packet, 3), 1);
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     hids_handler_impl(packet_type, channel, packet, size);
@@ -1456,6 +1501,7 @@ static void hids_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pa
     if ((packet_type != HCI_EVENT_PACKET && packet_type != HCI_EVENT_GATTSERVICE_META) || hci_event_packet_get_type(packet) != HCI_EVENT_GATTSERVICE_META) return;
     switch (hci_event_gattservice_meta_get_subevent_code(packet)) {
         case GATTSERVICE_SUBEVENT_HID_SERVICE_CONNECTED:
+            if (size < 8 || le_handle == HCI_CON_HANDLE_INVALID) return;
             if (gattservice_subevent_hid_service_connected_get_status(packet) != ERROR_CODE_SUCCESS) {
                 ble_setup_fail(gattservice_subevent_hid_service_connected_get_status(packet));
                 return;
@@ -1475,6 +1521,7 @@ static void hids_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pa
             }
             break;
         case GATTSERVICE_SUBEVENT_HID_SERVICE_REPORTS_NOTIFICATION:
+            if (size < 6) return;
             if (ultimate2c_setup_step == 3 &&
                 gattservice_subevent_hid_service_reports_notification_get_hids_cid(packet) == hids_cid &&
                 gattservice_subevent_hid_service_reports_notification_get_configuration(packet) == 1) {
@@ -1484,6 +1531,8 @@ static void hids_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pa
             }
             break;
         case GATTSERVICE_SUBEVENT_HID_REPORT: {
+            if (size < 9 || le_handle == HCI_CON_HANDLE_INVALID) return;
+            if (gattservice_subevent_hid_report_get_report_len(packet) > size - 9u) return;
             uint8_t service = gattservice_subevent_hid_report_get_service_index(packet);
             bb_driver_set_hid_descriptor(hids_host_descriptor_storage_get_descriptor_data(hids_cid, service), hids_host_descriptor_storage_get_descriptor_len(hids_cid, service));
             last_controller_report_at = btstack_run_loop_get_time_ms();
@@ -1493,11 +1542,12 @@ static void hids_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pa
             break;
         }
         case GATTSERVICE_SUBEVENT_HID_REPORT_WRITTEN:
+            if (size < 7) return;
             if (gattservice_subevent_hid_report_written_get_hids_cid(packet) == hids_cid && gattservice_subevent_hid_report_written_get_report_id(packet) == 5) eightbitdo64_rumble_write_pending = false;
             if (gattservice_subevent_hid_report_written_get_hids_cid(packet) == hids_cid && gattservice_subevent_hid_report_written_get_report_id(packet) == 3) xbox_rumble_write_pending = false;
             break;
         case GATTSERVICE_SUBEVENT_HID_SERVICE_DISCONNECTED:
-            controller_disconnected();
+            controller_disconnected(true);
             break;
         default:
             break;
@@ -1511,7 +1561,7 @@ static void ble_setup_fail(uint8_t status) {
     if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
     else {
         gap_connect_cancel();
-        controller_disconnected();
+        controller_disconnected(false);
     }
 }
 
@@ -1708,7 +1758,7 @@ static void classic_hid_event(uint8_t* packet) {
             bd_addr_t addr;
             uint16_t incoming_cid = hid_subevent_incoming_connection_get_hid_cid(packet);
             hid_subevent_incoming_connection_get_address(packet, addr);
-            if (reconnect_blocked(addr) || (!pairing && !remembered_address(addr))) {
+            if (closing_handle != HCI_CON_HANDLE_INVALID || reconnect_blocked(addr) || (!pairing && !remembered_address(addr))) {
                 hid_host_decline_connection(incoming_cid);
                 break;
             }
@@ -1727,7 +1777,6 @@ static void classic_hid_event(uint8_t* packet) {
                 break;
             }
             uint16_t previous_cid = classic_hid_cid;
-            classic_reconnect_at = 0;
             classic_hid_cid = incoming_cid;
             classic_connecting = true;
             classic_attempt_active = true;
@@ -1748,25 +1797,7 @@ static void classic_hid_event(uint8_t* packet) {
                 break;
             }
             if (hid_subevent_connection_opened_get_status(packet) != ERROR_CODE_SUCCESS) {
-                classic_connecting = false;
-                classic_attempt_active = false;
-                pending_classic_handle = HCI_CON_HANDLE_INVALID;
-                classic_hid_cid = 0;
-                classic_handle = HCI_CON_HANDLE_INVALID;
-                bb_driver_reset();
-                dualsense_output_seq = 0;
-                switch_output_seq = 0;
-                classic_switch_setup_sent = false;
-                classic_switch_protocol = false;
-                wiiu_setup_step = 0;
-                wiiu_setup_at = 0;
-                rumble_request_pending = false;
-                rumble_active = false;
-                rumble_stop_at = 0;
-                rumble_refresh_at = 0;
-                rumble_active_strength = 0;
-                start_scans();
-                if (!pairing) schedule_classic_reconnect(20000u);
+                controller_disconnected(false);
                 break;
             }
             if (!classic_attempt_active) {
@@ -1796,6 +1827,8 @@ static void classic_hid_event(uint8_t* packet) {
             }
             const char* known_name = remembered_name(connected_addr);
             const char* resolved_name = pending_name[0] && !name_has(pending_name, "bluetooth controller") ? pending_name : known_name;
+            classic_setup_pending = true;
+            classic_setup_started = btstack_run_loop_get_time_ms();
             activate_controller(connected_addr, 0, 0, 0, resolved_name);
             if (current_identity.kind == BB_CONTROLLER_GENERIC || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || name_has(current_identity.name, "bluetooth controller")) {
                 memcpy(connected_name_addr, connected_addr, sizeof(connected_name_addr));
@@ -1805,6 +1838,7 @@ static void classic_hid_event(uint8_t* packet) {
         }
         case HID_SUBEVENT_DESCRIPTOR_AVAILABLE:
             if (hid_subevent_descriptor_available_get_hid_cid(packet) != classic_hid_cid) break;
+            finish_classic_setup();
             if (hid_subevent_descriptor_available_get_status(packet) == ERROR_CODE_SUCCESS) {
                 const uint8_t* descriptor = hid_descriptor_storage_get_descriptor_data(classic_hid_cid);
                 uint16_t descriptor_len = hid_descriptor_storage_get_descriptor_len(classic_hid_cid);
@@ -1828,7 +1862,12 @@ static void classic_hid_event(uint8_t* packet) {
                     }
                 }
                 if (current_identity.kind == BB_CONTROLLER_DUALSHOCK3) send_ds3_activation();
-                if (current_identity.kind == BB_CONTROLLER_DUALSENSE || current_identity.kind == BB_CONTROLLER_DUALSENSE_EDGE) hid_host_send_get_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x05);
+                if (current_identity.kind == BB_CONTROLLER_DUALSENSE || current_identity.kind == BB_CONTROLLER_DUALSENSE_EDGE) {
+                    dualsense_activation_pending = true;
+                    dualsense_activation_attempts = 0;
+                    dualsense_activation_at = btstack_run_loop_get_time_ms();
+                    service_dualsense_activation(dualsense_activation_at);
+                }
                 if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "pro 3")) hid_host_send_get_report(classic_hid_cid, HID_REPORT_TYPE_FEATURE, 0x06);
             }
             break;
@@ -1848,6 +1887,7 @@ static void classic_hid_event(uint8_t* packet) {
             break;
         }
         case HID_SUBEVENT_REPORT: {
+            if (!classic_hid_cid || hid_subevent_report_get_hid_cid(packet) != classic_hid_cid) break;
             const uint8_t* report = hid_subevent_report_get_report(packet);
             uint16_t len = hid_subevent_report_get_report_len(packet);
             if (len && report[0] == 0xa1) {
@@ -1875,7 +1915,7 @@ static void classic_hid_event(uint8_t* packet) {
         }
         case HID_SUBEVENT_CONNECTION_CLOSED: {
             uint16_t closed_cid = hid_subevent_connection_closed_get_hid_cid(packet);
-            if (!classic_hid_cid || closed_cid == classic_hid_cid) controller_disconnected();
+            if (classic_hid_cid && closed_cid == classic_hid_cid) controller_disconnected(false);
             break;
         }
         default:
@@ -1905,7 +1945,6 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
                 stack_ready = true;
                 bb_state_set_bt_ready(true);
                 start_scans();
-                schedule_classic_reconnect(3000u);
             }
             break;
         case HCI_EVENT_CONNECTION_REQUEST: {
@@ -1920,7 +1959,6 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
                 classic_connecting = true;
                 classic_attempt_active = true;
                 classic_attempt_started = btstack_run_loop_get_time_ms();
-                classic_reconnect_at = 0;
                 stop_scans();
             }
             break;
@@ -1932,7 +1970,7 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
                 if (hci_event_connection_complete_get_status(packet) == ERROR_CODE_SUCCESS) {
                     pending_classic_handle = hci_event_connection_complete_get_connection_handle(packet);
                 } else {
-                    controller_disconnected();
+                    controller_disconnected(false);
                 }
             }
             break;
@@ -2075,9 +2113,13 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
         }
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
             hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
+            if (release_closing_handle(handle)) {
+                start_scans();
+                break;
+            }
             if ((le_handle != HCI_CON_HANDLE_INVALID && handle == le_handle) ||
                 (classic_handle != HCI_CON_HANDLE_INVALID && handle == classic_handle) ||
-                (pending_classic_handle != HCI_CON_HANDLE_INVALID && handle == pending_classic_handle)) controller_disconnected();
+                (pending_classic_handle != HCI_CON_HANDLE_INVALID && handle == pending_classic_handle)) controller_disconnected(true);
             break;
         }
         default:
@@ -2097,6 +2139,17 @@ static void stop_pairing_impl(void);
 static void forget_all_impl(void);
 static bool forget_device_impl(const uint8_t address[6]);
 
+static void service_link_recovery(uint32_t now) {
+    if (closing_handle != HCI_CON_HANDLE_INVALID && gap_get_connection_type(closing_handle) == GAP_CONNECTION_INVALID) {
+        closing_handle = HCI_CON_HANDLE_INVALID;
+        start_scans();
+    }
+    if ((le_handle != HCI_CON_HANDLE_INVALID && gap_get_connection_type(le_handle) == GAP_CONNECTION_INVALID) ||
+        (classic_handle != HCI_CON_HANDLE_INVALID && gap_get_connection_type(classic_handle) == GAP_CONNECTION_INVALID)) controller_disconnected(true);
+    if (ble_connecting && le_handle == HCI_CON_HANDLE_INVALID && !strcmp(ble_stage, "connecting") &&
+        (uint32_t)(now - ble_attempt_started) >= 4000u) ble_setup_fail(ERROR_CODE_CONNECTION_TIMEOUT);
+}
+
 static void service_slot(void) {
     if (bb_multi_mode()) {
         bb_runtime_state_t live;
@@ -2104,6 +2157,9 @@ static void service_slot(void) {
         if (live.controller_connected) current_controller_index = live.controller_index;
     }
     uint32_t now = btstack_run_loop_get_time_ms();
+    service_link_recovery(now);
+    service_classic_setup(now);
+    service_dualsense_activation(now);
     if (multi_disconnect_requests[bb_slot_current()]) {
         multi_disconnect_requests[bb_slot_current()] = false;
         disconnect_current_impl();
@@ -2209,7 +2265,7 @@ static void service_slot(void) {
         hci_con_handle_t handle = pending_classic_handle;
         if (cid) hid_host_disconnect(cid);
         if (handle != HCI_CON_HANDLE_INVALID) gap_disconnect(handle);
-        controller_disconnected();
+        controller_disconnected(false);
     }
     if (classic_hid_cid && current_controller_index >= 0 && current_identity.kind == BB_CONTROLLER_8BITDO &&
         name_has(current_identity.name, "arcade stick") && (int32_t)(now - arcade_battery_poll_at) >= 0) {
@@ -2229,22 +2285,7 @@ static void service_slot(void) {
         if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
         else if (classic_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(classic_handle);
         if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
-        controller_disconnected();
-    }
-    if (!bb_multi_mode() && classic_reconnect_at && (int32_t)(now - classic_reconnect_at) >= 0) {
-        classic_reconnect_at = 0;
-        bb_runtime_state_t state;
-        bb_state_get(&state);
-        if (!pairing && !connection_in_progress() && !state.controller_connected) {
-            if (!bb_usb_ready()) {
-                schedule_classic_reconnect(3000u);
-            } else {
-                bd_addr_t addr;
-                char name[BB_MAX_NAME];
-                if (classic_reconnect_target(addr, name, sizeof(name))) connect_classic(addr, name);
-                else schedule_classic_reconnect(3000u);
-            }
-        } else if (!state.controller_connected) schedule_classic_reconnect(3000u);
+        controller_disconnected(false);
     }
     if (manual_disconnect_pending && (int32_t)(now - manual_disconnect_at) >= 0) {
         manual_disconnect_pending = false;
@@ -2253,19 +2294,6 @@ static void service_slot(void) {
     }
     service_rumble();
 }
-static void service_multi_reconnect(uint32_t now) {
-    if (!bb_multi_mode() || pairing || connection_in_progress() || ble_address_lookup_pending || !bb_usb_ready()) return;
-    if (!scanning || !discovery_window_active || (uint32_t)(now - discovery_started_at) < 5000u) return;
-    if ((int32_t)(now - multi_reconnect_at) < 0) return;
-    int slot = free_slot();
-    if (slot < 0) return;
-    bb_slot_enter((uint8_t)slot);
-    bd_addr_t address;
-    char name[BB_MAX_NAME];
-    multi_reconnect_at = now + 1000u;
-    if (classic_reconnect_target(address, name, sizeof(name))) connect_classic(address, name);
-}
-
 static void usb_watch_handler(btstack_timer_source_t* timer) {
     uint8_t previous = bb_slot_current();
     if (pairing_command) {
@@ -2303,7 +2331,6 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
         service_slot();
     }
     if ((pairing || bb_multi_mode()) && !connection_in_progress() && free_slot() >= 0 && bb_usb_ready()) start_scans();
-    service_multi_reconnect(now);
     bb_slot_enter(previous);
     btstack_run_loop_set_timer(timer, 100);
     btstack_run_loop_add_timer(timer);
@@ -2344,7 +2371,6 @@ void bb_bt_host_init(void) {
     reset_classic_name_candidates();
     bb_driver_reset();
     bb_config_get(&remembered_cfg);
-    classic_reconnect_cursor = remembered_cfg.active_controller;
     const btstack_tlv_t* tlv_impl = NULL;
     void* tlv_context = NULL;
     btstack_tlv_get_instance(&tlv_impl, &tlv_context);
@@ -2386,11 +2412,11 @@ void bb_bt_host_init(void) {
     btstack_run_loop_add_timer(&usb_watch_timer);
 }
 
-void bb_bt_host_start_pairing(void) { if (bb_multi_mode()) pairing_command = 1; else start_pairing_impl(); }
-void bb_bt_host_stop_pairing(void) { if (bb_multi_mode()) pairing_command = 2; else stop_pairing_impl(); }
-void bb_bt_host_forget_all(void) { if (bb_multi_mode()) forget_all_command = true; else forget_all_impl(); }
+bool bb_bt_host_pairing_available(void) { return free_slot() >= 0; }
+void bb_bt_host_start_pairing(void) { pairing_command = 1; }
+void bb_bt_host_stop_pairing(void) { pairing_command = 2; }
+void bb_bt_host_forget_all(void) { forget_all_command = true; }
 bool bb_bt_host_forget_device(const uint8_t address[6]) {
-    if (!bb_multi_mode()) return forget_device_impl(address);
     if (!address) return false;
     for (unsigned i = 0; i < BB_MAX_CONTROLLERS; ++i) {
         if (forget_commands[i]) continue;
@@ -2402,8 +2428,8 @@ bool bb_bt_host_forget_device(const uint8_t address[6]) {
 }
 
 static void start_pairing_impl(void) {
+    if (free_slot() < 0) return;
     reset_classic_name_candidates();
-    classic_reconnect_at = 0;
     pairing = true;
     bb_state_set_pairing(true);
     gap_discoverable_control(1);
@@ -2419,21 +2445,17 @@ static void stop_pairing_impl(void) {
     gap_discoverable_control(1);
     stop_scans();
     start_scans();
-    schedule_classic_reconnect(3000u);
 }
 
 static void forget_all_impl(void) {
-    if (bb_multi_mode()) {
-        uint8_t previous = bb_slot_current();
-        for (uint8_t i = 0; i < BB_MAX_SLOTS; ++i) {
-            bb_slot_enter(i);
-            if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
-            if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
-            controller_disconnected();
-        }
-        bb_slot_enter(previous);
+    uint8_t previous = bb_slot_current();
+    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+        bb_slot_enter(i);
+        if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
+        if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
+        controller_disconnected(false);
     }
-    classic_reconnect_at = 0;
+    bb_slot_enter(previous);
     gap_delete_all_link_keys();
     for (int i = 0; i < NVM_NUM_DEVICE_DB_ENTRIES; ++i) le_device_db_remove(i);
     pairing = true;
@@ -2445,7 +2467,6 @@ static void forget_all_impl(void) {
 
 static bool forget_device_impl(const uint8_t address[6]) {
     if (!address) return false;
-    classic_reconnect_at = 0;
     bd_addr_t addr;
     memcpy(addr, address, 6);
     gap_drop_link_key_for_bd_addr(addr);
@@ -2459,14 +2480,13 @@ static bool forget_device_impl(const uint8_t address[6]) {
     if (memcmp(current_identity.address, addr, 6) == 0) {
         if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
         if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
-        controller_disconnected();
+        controller_disconnected(false);
     }
     start_scans();
     return true;
 }
 
 bool bb_bt_host_disconnect_current(void) {
-    if (!bb_multi_mode()) return disconnect_current_impl();
     int slot = bb_controller_slot(bb_selected_controller_index());
     if (slot < 0) return false;
     multi_disconnect_requests[slot] = true;

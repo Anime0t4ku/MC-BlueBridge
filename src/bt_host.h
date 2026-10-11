@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include <stddef.h>
 void bb_bt_host_init(void);
+bool bb_bt_host_pairing_available(void);
 void bb_bt_host_start_pairing(void);
 void bb_bt_host_stop_pairing(void);
 void bb_bt_host_forget_all(void);

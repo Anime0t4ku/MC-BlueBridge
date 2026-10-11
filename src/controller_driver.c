@@ -33,6 +33,7 @@ typedef struct {
     uint16_t diagnostic_report_original_length;
     uint32_t diagnostic_report_sequence;
     bb_controller_identity_t identity;
+    uint8_t descriptor_storage[8192];
     const uint8_t* hid_descriptor;
     uint16_t hid_descriptor_len;
     bb_input_state_t last_input_state;
@@ -49,8 +50,6 @@ typedef struct {
     uint16_t n64_above[2];
 } bb_driver_context_t;
 static bb_driver_context_t driver_slots[BB_MAX_SLOTS] = {
-{.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}},
-{.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}},
 {.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}},
 {.diagnostic_battery_request_status=-1,.diagnostic_battery_status=-1,.gamecube_trigger_rest={255,255},.n64_center={2048,2048},.n64_below={2047,2047},.n64_above={2047,2047}}
 };
@@ -1044,7 +1043,12 @@ static bool is_8bitdo64_d(void) {
 
 static bool parse_8bitdo64_d(const uint8_t* report, uint16_t length) {
     static const uint8_t descriptor[] = {0x05,0x01,0x09,0x05,0xa1,0x01,0x85,0x01,0x15,0x00,0x25,0x01,0x35,0x00,0x45,0x01,0x75,0x01,0x95,0x14,0x05,0x09,0x19,0x01,0x29,0x12,0x81,0x02,0x05,0x01,0x15,0x00,0x25,0x07,0x46,0x3b,0x01,0x75,0x04,0x95,0x01,0x65,0x14,0x09,0x39,0x81,0x42,0x15,0x00,0x26,0xff,0x00,0x09,0x30,0x09,0x31,0x09,0x32,0x09,0x35,0x75,0x08,0x95,0x04,0x81,0x02,0x05,0x02,0x15,0x00,0x26,0xff,0x00,0x09,0xc4,0x09,0xc5,0x95,0x02,0x75,0x08,0x81,0x02,0x05,0x06,0x09,0x20,0x15,0x00,0x25,0x64,0x75,0x08,0x95,0x01,0x81,0x02,0x05,0x0f,0x09,0x70,0x85,0x05,0x15,0x00,0x25,0x64,0x75,0x08,0x95,0x04,0x91,0x02,0xc0};
-    if (!report || length < 11 || report[0] != 1 || !hid_descriptor || hid_descriptor_len != sizeof(descriptor) || memcmp(hid_descriptor, descriptor, sizeof(descriptor))) return false;
+    if (!report || length < 11 || report[0] != 1 || !hid_descriptor || hid_descriptor_len != sizeof(descriptor)) return false;
+    for (uint16_t i = 0; i < sizeof(descriptor); ++i) {
+        if (hid_descriptor[i] == descriptor[i]) continue;
+        if (i == 25 && hid_descriptor[i] == 0x14) continue;
+        return false;
+    }
     bb_input_state_t s;
     bb_input_clear(&s);
     uint32_t buttons = report[1] | ((uint32_t)report[2] << 8) | ((uint32_t)(report[3] & 15) << 16);
@@ -1342,8 +1346,15 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
 
 void bb_driver_set_hid_descriptor(const uint8_t* descriptor, uint16_t length) {
     pro2_home_pressed = false;
-    hid_descriptor = descriptor;
-    hid_descriptor_len = length;
+    uint8_t* storage = driver_slots[bb_slot_current()].descriptor_storage;
+    if (!descriptor || !length || length > sizeof(driver_slots[0].descriptor_storage)) {
+        hid_descriptor = NULL;
+        hid_descriptor_len = 0;
+    } else {
+        if (hid_descriptor_len != length || memcmp(storage, descriptor, length) != 0) memmove(storage, descriptor, length);
+        hid_descriptor = storage;
+        hid_descriptor_len = length;
+    }
     if (have_early_arcade_battery_report && bb_driver_battery_report_id() == 4 && bb_driver_battery_report_type() == HID_REPORT_TYPE_INPUT) {
         bb_driver_handle_battery_report(early_arcade_battery_report, sizeof(early_arcade_battery_report));
     }

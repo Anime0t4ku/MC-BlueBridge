@@ -122,6 +122,7 @@ static bool send_switch_state(const bb_gamepad_report_t* r) {
 
 static void send_pending(void) {
     bb_output_mode_t mode = bb_output_mode();
+    if (mode == BB_OUTPUT_XINPUT ? !bb_xinput_ready() : !tud_hid_n_ready(usb_slot)) return;
     bb_gamepad_report_t report;
     bool send = false;
     critical_section_enter_blocking(&usb_lock);
@@ -158,6 +159,11 @@ static void send_pending(void) {
         dirty = true;
         critical_section_exit(&usb_lock);
     }
+}
+
+void bb_usb_service_pending(void) {
+    for (usb_slot = 0; usb_slot < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++usb_slot) send_pending();
+    usb_slot = 0;
 }
 
 static void feedback_reset_all(void) {
@@ -198,10 +204,10 @@ void bb_usb_core1(void) {
             }
         }
         tud_task();
+        bb_usb_service_pending();
         bb_cdc_poll();
         handle_reenumeration();
-        for (usb_slot = 0; usb_slot < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++usb_slot) send_pending();
-        usb_slot = 0;
+        bb_usb_service_pending();
         bb_config_flush_pending();
         if (bb_mode_restart_pending()) {
             sleep_ms(300);

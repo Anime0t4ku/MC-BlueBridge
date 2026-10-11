@@ -87,12 +87,10 @@ static const uint8_t mister_config_desc[] = {
 
 #define MULTI_CONFIG_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + BB_MAX_SLOTS * TUD_HID_DESC_LEN)
 static const uint8_t multi_config_desc[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 6, 0, MULTI_CONFIG_LEN, 0, 100),
+    TUD_CONFIG_DESCRIPTOR(1, 2 + BB_MAX_SLOTS, 0, MULTI_CONFIG_LEN, 0, 100),
     TUD_CDC_DESCRIPTOR(0, 4, 0x81, 8, 0x02, 0x82, 64),
     TUD_HID_DESCRIPTOR(2, 5, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x83, 64, 1),
-    TUD_HID_DESCRIPTOR(3, 6, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x84, 64, 1),
-    TUD_HID_DESCRIPTOR(4, 7, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x85, 64, 1),
-    TUD_HID_DESCRIPTOR(5, 8, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x86, 64, 1)
+    TUD_HID_DESCRIPTOR(3, 6, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x84, 64, 1)
 };
 
 static const uint8_t switch_config_desc[] = {

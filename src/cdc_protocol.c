@@ -35,6 +35,8 @@ static void write_text(const char* text) {
     size_t off = 0;
     uint32_t idle = 0;
     while (off < len && idle < 2000) {
+        tud_task();
+        bb_usb_service_pending();
         uint32_t n = tud_cdc_write(text + off, (uint32_t)(len - off));
         if (n) {
             off += n;
@@ -282,6 +284,7 @@ static void handle_command(char* text) {
         return;
     }
     if (!strcmp(cmd, "PAIR_START")) {
+        if (!bb_bt_host_pairing_available()) { send_err(id, "Controller limit reached; disconnect a controller before pairing"); return; }
         bb_platform_start_pairing();
         send_ok(id, "pairing");
         return;
@@ -591,6 +594,7 @@ void bb_cdc_poll(void) {
         if (c == '\n') {
             line[used] = 0;
             if (used) handle_command(line);
+            bb_usb_service_pending();
             used = 0;
         } else if (used + 1 < sizeof(line)) {
             line[used++] = c;
