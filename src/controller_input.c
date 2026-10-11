@@ -380,6 +380,11 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
                 c.buttons = 0x00007fffu;
                 c.right_stick = 0;
             }
+            else if (contains_ci(name, "nes30") && !contains_ci(name, "pro") && !contains_ci(name, "arcade")) {
+                c.buttons = 0x0000033fu;
+                c.left_stick = c.right_stick = 0;
+                c.left_trigger = c.right_trigger = 0;
+            }
             else if (contains_ci(name, "sn30 pro")) c.buttons = 0x00001fffu;
             else if (contains_ci(name, "pro 3")) c.buttons = 0x000f1fffu;
             else if (contains_ci(name, "pro 2")) c.buttons = 0x00031fffu;
@@ -484,6 +489,8 @@ void bb_controller_display_name(bb_controller_kind_t kind, const char* raw_name,
         else if (contains_ci(raw_name, "pro 2")) value = "8BitDo Pro 2";
         else if (contains_ci(raw_name, "ultimate 2c wireless")) value = "8BitDo Ultimate 2C Wireless";
         else if (contains_ci(raw_name, "ultimate")) value = "8BitDo Ultimate Controller";
+        else if (contains_ci(raw_name, "nes30 pro")) value = "8BitDo NES30 Pro";
+        else if (contains_ci(raw_name, "nes30")) value = "8BitDo NES30 Controller";
         else if (contains_ci(raw_name, "sn30 pro")) value = "8BitDo SN30 Pro";
         else if (contains_ci(raw_name, "sn30")) value = "8BitDo SN30 Controller";
         else if (contains_ci(raw_name, "m30")) value = "8BitDo M30 Controller";

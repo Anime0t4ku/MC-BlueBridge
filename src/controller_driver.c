@@ -1203,6 +1203,10 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         s.buttons |= last_input_state.buttons & (1u << 12);
     }
     s.buttons = canonicalize_buttons(s.buttons);
+    if (identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("nes30") &&
+        !eightbitdo_name_has("pro") && !eightbitdo_name_has("arcade")) {
+        button_capabilities &= bb_controller_capabilities(identity.kind, identity.name).buttons;
+    }
     bb_state_update_button_capabilities(canonicalize_buttons(button_capabilities));
     submit_state(&s);
     return true;

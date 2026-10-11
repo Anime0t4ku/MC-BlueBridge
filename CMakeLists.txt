@@ -35,6 +35,7 @@ add_executable(mc_bluebridge
   src/cdc_protocol.c
   src/config_store.c
   src/led_status.c
+  src/bootsel_button.c
 )
 
 target_include_directories(mc_bluebridge PRIVATE

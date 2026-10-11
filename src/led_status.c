@@ -1,4 +1,5 @@
 #include "led_status.h"
+#include "bootsel_button.h"
 #include "bluebridge_state.h"
 #include "pico/cyw43_arch.h"
 #include "pico/stdlib.h"
@@ -20,6 +21,7 @@ static void timer_handler(btstack_timer_source_t* ts) {
     (void)ts;
     tick++;
     uint32_t now = to_ms_since_boot(get_absolute_time());
+    bb_bootsel_poll(now);
     int on = 0;
     if (error_state) {
         on = (tick & 1u) == 0;
@@ -29,8 +31,15 @@ static void timer_handler(btstack_timer_source_t* ts) {
     } else {
         bb_runtime_state_t state;
         bb_state_get(&state);
-        if (state.controller_connected) on = 1;
-        else if (state.pairing) on = ((tick / 2u) & 1u) == 0;
+        bool connected = state.controller_connected;
+        if (bb_multi_mode()) {
+            for (uint8_t slot = 0; slot < BB_MAX_SLOTS; ++slot) {
+                bb_state_get_slot(slot, &state);
+                connected = connected || state.controller_connected;
+            }
+        }
+        if (state.pairing) on = ((tick / 2u) & 1u) == 0;
+        else if (connected) on = 1;
         else on = ((tick / 8u) & 1u) == 0;
     }
     apply_led(on);

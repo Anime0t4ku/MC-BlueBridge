@@ -53,6 +53,16 @@ static bool usb_was_ready;
 static uint32_t usb_lost_since;
 static uint32_t multi_reconnect_at;
 static uint8_t classic_reconnect_cursor;
+static uint32_t discovery_started_at;
+static bool discovery_window_active;
+typedef struct {
+    bd_addr_t address;
+    uint32_t retry_at;
+    uint8_t failures;
+    bool used;
+} bb_reconnect_retry_t;
+static bb_reconnect_retry_t reconnect_retries[BB_MAX_CONTROLLERS];
+static uint8_t reconnect_retry_cursor;
 static bool ble_address_lookup_pending;
 static bd_addr_t ble_address_lookup_addr;
 static uint8_t ble_address_lookup_type;
@@ -258,6 +268,41 @@ static int route_hci(const uint8_t* packet, uint16_t size) {
     }
     int known = slot_for_address(addr);
     return known >= 0 ? known : free_slot();
+}
+
+bool bb_bt_host_diagnostics(char* out, size_t size) {
+    return bb_bt_host_diagnostics_slot(bb_slot_current(), out, size);
+}
+
+bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
+    if (slot >= (bb_multi_mode() ? BB_MAX_SLOTS : 1)) return false;
+    const bb_host_context_t* context = &host_slots[slot];
+    if (!out || size < 512) return false;
+    char name_hex[65];
+    static const char digits[] = "0123456789abcdef";
+    const char* peer_name = context->ble_peer_name[0] ? context->ble_peer_name : context->pending_name;
+    size_t name_length = strlen(peer_name);
+    for (size_t i = 0; i < name_length; ++i) {
+        uint8_t value = (uint8_t)peer_name[i];
+        name_hex[i * 2] = digits[value >> 4];
+        name_hex[i * 2 + 1] = digits[value & 15];
+    }
+    name_hex[name_length * 2] = 0;
+    char identity_hex[13];
+    char transport_hex[13];
+    for (size_t i = 0; i < 6; ++i) {
+        identity_hex[i * 2] = digits[context->current_identity.address[i] >> 4];
+        identity_hex[i * 2 + 1] = digits[context->current_identity.address[i] & 15];
+        transport_hex[i * 2] = digits[context->pending_addr[i] >> 4];
+        transport_hex[i * 2 + 1] = digits[context->pending_addr[i] & 15];
+    }
+    identity_hex[12] = 0;
+    transport_hex[12] = 0;
+    int written = snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"identity_address\":\"%s\",\"transport_address\":\"%s\",\"slot\":%u,\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s,\"security_retry\":%s,\"secure_connections_only\":%s}",
+        name_hex, identity_hex, transport_hex, slot, context->ble_key_minimum, context->ble_authentication, context->ble_pairing_reason, context->ble_stage, context->ble_failed_stage, context->ble_setup_status, (unsigned long)context->ble_attempt_count,
+        context->ble_connecting ? "true" : "false", context->le_handle, context->hids_cid, context->current_controller_index,
+        context->classic_connecting ? "true" : "false", context->classic_attempt_active ? "true" : "false", context->ble_security_retry ? "true" : "false", context->ble_secure_connections_only ? "true" : "false");
+    return written >= 0 && (size_t)written < size;
 }
 
 #define classic_attempt_started (host_slots[bb_slot_current()].classic_attempt_started)
@@ -806,6 +851,42 @@ static const char* remembered_name(const uint8_t addr[6]) {
     return NULL;
 }
 
+static bb_reconnect_retry_t* reconnect_retry(const uint8_t address[6], bool create) {
+    for (uint8_t i = 0; i < BB_MAX_CONTROLLERS; ++i) {
+        if (reconnect_retries[i].used && same_address(reconnect_retries[i].address, address)) return &reconnect_retries[i];
+    }
+    if (!create) return NULL;
+    uint8_t selected = reconnect_retry_cursor;
+    for (uint8_t i = 0; i < BB_MAX_CONTROLLERS; ++i) {
+        if (!reconnect_retries[i].used) { selected = i; break; }
+    }
+    bb_reconnect_retry_t* retry = &reconnect_retries[selected];
+    memset(retry, 0, sizeof(*retry));
+    memcpy(retry->address, address, 6);
+    retry->used = true;
+    reconnect_retry_cursor = (uint8_t)((selected + 1) % BB_MAX_CONTROLLERS);
+    return retry;
+}
+
+static bool reconnect_retry_ready(const uint8_t address[6], uint32_t now) {
+    bb_reconnect_retry_t* retry = reconnect_retry(address, false);
+    return !retry || (int32_t)(now - retry->retry_at) >= 0;
+}
+
+static void reconnect_retry_started(const uint8_t address[6]) {
+    if (!bb_multi_mode() || pairing) return;
+    bb_reconnect_retry_t* retry = reconnect_retry(address, true);
+    if (retry->failures < 5) ++retry->failures;
+    uint32_t delay = 5000u << (retry->failures - 1);
+    if (delay > 60000u) delay = 60000u;
+    retry->retry_at = btstack_run_loop_get_time_ms() + delay;
+}
+
+static void reconnect_retry_succeeded(const uint8_t address[6]) {
+    bb_reconnect_retry_t* retry = reconnect_retry(address, false);
+    if (retry) memset(retry, 0, sizeof(*retry));
+}
+
 static bool classic_reconnect_target(bd_addr_t addr, char* name, size_t name_size) {
     bb_config_get(&remembered_cfg);
     if (!remembered_cfg.controller_count || remembered_cfg.active_controller >= remembered_cfg.controller_count) return false;
@@ -813,6 +894,7 @@ static bool classic_reconnect_target(bd_addr_t addr, char* name, size_t name_siz
         uint8_t index = (uint8_t)((classic_reconnect_cursor + i) % remembered_cfg.controller_count);
         const bb_controller_t* controller = &remembered_cfg.controllers[index];
         if (slot_for_address(controller->bluetooth_address) >= 0 || reconnect_blocked(controller->bluetooth_address)) continue;
+        if (bb_multi_mode() && !reconnect_retry_ready(controller->bluetooth_address, btstack_run_loop_get_time_ms())) continue;
         if (controller->native_vendor_id == 0x054c || name_has(controller->name, "dualsense") || name_has(controller->name, "wireless controller") || name_has(controller->name, "dualshock")) continue;
         link_key_t key;
         link_key_type_t type;
@@ -941,6 +1023,7 @@ static void refresh_classic_identity(const char* name, uint16_t vid, uint16_t pi
     if (pid) updated.product_id = pid;
     const char* resolved = name && name[0] ? name : current_identity.name;
     if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "sn30 pro") && name_has(resolved, "8bitdo controller")) resolved = current_identity.name;
+    if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "nes30") && name_has(resolved, "8bitdo controller")) resolved = current_identity.name;
     if (updated.vendor_id == 0x2dc8 && updated.product_id == 0x9020) resolved = "8BitDo Micro";
     if (current_identity.kind == BB_CONTROLLER_8BITDO && name_has(current_identity.name, "arcade stick") && name_has(resolved, "pro controller")) resolved = current_identity.name;
     bb_controller_kind_t kind = bb_controller_identify(updated.vendor_id, updated.product_id, resolved);
@@ -1088,6 +1171,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     classic_attempt_active = false;
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
     ble_connecting = false;
+    reconnect_retry_succeeded(current_identity.address);
     if (le_handle != HCI_CON_HANDLE_INVALID) ble_stage = "active";
     classic_reconnect_at = 0;
 
@@ -1180,6 +1264,10 @@ static void start_scans(void) {
     if (!stack_ready || connection_in_progress() || free_slot() < 0) return;
     if (!scanning) {
         scanning = true;
+        if (bb_multi_mode()) {
+            discovery_started_at = btstack_run_loop_get_time_ms();
+            discovery_window_active = true;
+        }
         bb_state_set_scanning(true);
         gap_set_scan_parameters(1, 48, 48);
         gap_start_scan();
@@ -1190,6 +1278,7 @@ static void start_scans(void) {
 static void stop_scans(void) {
     bool was_scanning = scanning;
     scanning = false;
+    discovery_window_active = false;
     classic_inquiry_active = false;
     classic_inquiry_retry_at = 0;
     bb_state_set_scanning(false);
@@ -1211,6 +1300,8 @@ static void connect_classic(const uint8_t addr[6], const char* name) {
     copy_name(pending_name, sizeof(pending_name), name);
     pending_vid = 0;
     pending_pid = 0;
+    reconnect_retry_started(pending_addr);
+    gap_set_page_timeout(bb_multi_mode() && !pairing ? 4800u : 0x6000u);
     uint8_t status = hid_host_connect(pending_addr, HID_PROTOCOL_MODE_REPORT, &classic_hid_cid);
     if (status != ERROR_CODE_SUCCESS) {
         classic_connecting = false;
@@ -2162,6 +2253,19 @@ static void service_slot(void) {
     }
     service_rumble();
 }
+static void service_multi_reconnect(uint32_t now) {
+    if (!bb_multi_mode() || pairing || connection_in_progress() || ble_address_lookup_pending || !bb_usb_ready()) return;
+    if (!scanning || !discovery_window_active || (uint32_t)(now - discovery_started_at) < 5000u) return;
+    if ((int32_t)(now - multi_reconnect_at) < 0) return;
+    int slot = free_slot();
+    if (slot < 0) return;
+    bb_slot_enter((uint8_t)slot);
+    bd_addr_t address;
+    char name[BB_MAX_NAME];
+    multi_reconnect_at = now + 1000u;
+    if (classic_reconnect_target(address, name, sizeof(name))) connect_classic(address, name);
+}
+
 static void usb_watch_handler(btstack_timer_source_t* timer) {
     uint8_t previous = bb_slot_current();
     if (pairing_command) {
@@ -2198,17 +2302,8 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
         bb_slot_enter(i);
         service_slot();
     }
-    if (pairing && !connection_in_progress() && free_slot() >= 0) start_scans();
-    if (bb_multi_mode() && !pairing && !connection_in_progress() && bb_usb_ready() && (int32_t)(now - multi_reconnect_at) >= 0) {
-        int slot = free_slot();
-        if (slot >= 0) {
-            bb_slot_enter((uint8_t)slot);
-            bd_addr_t address;
-            char name[BB_MAX_NAME];
-            if (classic_reconnect_target(address, name, sizeof(name))) connect_classic(address, name);
-        }
-        multi_reconnect_at = now + 3000u;
-    }
+    if ((pairing || bb_multi_mode()) && !connection_in_progress() && free_slot() >= 0 && bb_usb_ready()) start_scans();
+    service_multi_reconnect(now);
     bb_slot_enter(previous);
     btstack_run_loop_set_timer(timer, 100);
     btstack_run_loop_add_timer(timer);
@@ -2442,30 +2537,3 @@ void bb_bt_host_set_slot_rumble(uint8_t slot, uint8_t left, uint8_t right) {
     context->queued_pending = true;
 }
 
-bool bb_bt_host_diagnostics(char* out, size_t size) {
-    if (!out || size < 512) return false;
-    char name_hex[65];
-    static const char digits[] = "0123456789abcdef";
-    size_t name_length = strlen(ble_peer_name);
-    for (size_t i = 0; i < name_length; ++i) {
-        uint8_t value = (uint8_t)ble_peer_name[i];
-        name_hex[i * 2] = digits[value >> 4];
-        name_hex[i * 2 + 1] = digits[value & 15];
-    }
-    name_hex[name_length * 2] = 0;
-    char identity_hex[13];
-    char transport_hex[13];
-    for (size_t i = 0; i < 6; ++i) {
-        identity_hex[i * 2] = digits[current_identity.address[i] >> 4];
-        identity_hex[i * 2 + 1] = digits[current_identity.address[i] & 15];
-        transport_hex[i * 2] = digits[pending_addr[i] >> 4];
-        transport_hex[i * 2 + 1] = digits[pending_addr[i] & 15];
-    }
-    identity_hex[12] = 0;
-    transport_hex[12] = 0;
-    snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"identity_address\":\"%s\",\"transport_address\":\"%s\",\"slot\":%u,\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s,\"security_retry\":%s,\"secure_connections_only\":%s}",
-        name_hex, identity_hex, transport_hex, bb_slot_current(), ble_key_minimum, ble_authentication, ble_pairing_reason, ble_stage, ble_failed_stage, ble_setup_status, (unsigned long)ble_attempt_count,
-        ble_connecting ? "true" : "false", le_handle, hids_cid, current_controller_index,
-        classic_connecting ? "true" : "false", classic_attempt_active ? "true" : "false", ble_security_retry ? "true" : "false", ble_secure_connections_only ? "true" : "false");
-    return true;
-}

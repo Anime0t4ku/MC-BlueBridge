@@ -228,7 +228,7 @@ static void handle_command(char* text) {
         bb_adapter_name_get(adapter_name, sizeof(adapter_name));
         bb_adapter_custom_name_get(custom_name, sizeof(custom_name));
         pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
         send_ok(id, out);
         return;
     }
@@ -244,8 +244,12 @@ static void handle_command(char* text) {
         return;
     }
     if (!strcmp(cmd, "BT_DIAGNOSTICS")) {
-        char out[512];
-        if (bb_bt_host_diagnostics(out, sizeof(out))) send_ok(id, out);
+        char out[1024];
+        char* value = next_field(&cursor);
+        char* end = NULL;
+        long slot = value ? strtol(value, &end, 10) : -1;
+        if (value && (!value[0] || *end || slot < 0 || slot >= (bb_multi_mode() ? BB_MAX_SLOTS : 1))) { send_err(id, "slot"); return; }
+        if (value ? bb_bt_host_diagnostics_slot((uint8_t)slot, out, sizeof(out)) : bb_bt_host_diagnostics(out, sizeof(out))) send_ok(id, out);
         else send_err(id, "bt_diagnostics");
         return;
     }
