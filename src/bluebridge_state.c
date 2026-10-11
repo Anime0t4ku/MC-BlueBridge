@@ -53,6 +53,15 @@ bool bb_multi_mode_set(bool enabled) {
             config_state.single_output_mode = config_state.output_mode;
             config_state.output_mode = BB_OUTPUT_MISTER;
         } else {
+            int controller = -1;
+            for (unsigned slot = 0; slot < BB_MAX_SLOTS; ++slot) {
+                if (!runtime_slots[slot].controller_connected) continue;
+                int index = runtime_slots[slot].controller_index;
+                if (index < 0 || index >= config_state.controller_count) continue;
+                if (controller < 0 || index == management_controller_index) controller = index;
+                if (index == management_controller_index) break;
+            }
+            if (controller >= 0) config_state.active_controller = (uint8_t)controller;
             uint8_t mode = config_state.single_output_mode;
             config_state.output_mode = mode >= BB_OUTPUT_MISTER && mode <= BB_OUTPUT_SWITCH ? mode : BB_OUTPUT_MISTER;
         }
@@ -150,6 +159,7 @@ void bb_state_init(void) {
 
 void bb_state_set_controller(bool connected, int idx, const char* name) {
     critical_section_enter_blocking(&lock);
+    int previous_index = runtime_state.controller_index;
     runtime_state.controller_connected = connected;
     runtime_state.controller_index = connected ? idx : -1;
     snprintf(runtime_state.controller_name, sizeof(runtime_state.controller_name), "%s", name ? name : (connected ? "Bluetooth Controller" : ""));
@@ -174,6 +184,14 @@ void bb_state_set_controller(bool connected, int idx, const char* name) {
         runtime_state.captured_button = 0xff;
         capture_previous_buttons = 0;
         capture_button_mask = 0;
+    }
+    if (!connected && boot_multi && previous_index == management_controller_index) {
+        for (unsigned slot = 0; slot < BB_MAX_SLOTS; ++slot) {
+            if (runtime_slots[slot].controller_connected) {
+                management_controller_index = runtime_slots[slot].controller_index;
+                break;
+            }
+        }
     }
     critical_section_exit(&lock);
 }
@@ -741,7 +759,13 @@ bool bb_controller_forget(uint8_t index, uint8_t address_out[6]) {
         config_state.controller_count--;
         if (boot_multi) {
             for (unsigned slot = 0; slot < BB_MAX_SLOTS; ++slot) {
-                if (runtime_slots[slot].controller_index == index) runtime_slots[slot].controller_index = -1;
+                if (runtime_slots[slot].controller_index == index) {
+                    runtime_slots[slot].controller_index = -1;
+                    runtime_slots[slot].controller_connected = false;
+                    runtime_slots[slot].controller_name[0] = 0;
+                    memset(&runtime_slots[slot].report, 0, sizeof(runtime_slots[slot].report));
+                    runtime_slots[slot].raw_buttons = 0;
+                }
                 else if (runtime_slots[slot].controller_index > index) runtime_slots[slot].controller_index--;
             }
         }
@@ -759,6 +783,23 @@ bool bb_controller_forget(uint8_t index, uint8_t address_out[6]) {
 
 static bool address_equal(const uint8_t a[6], const uint8_t b[6]) {
     return memcmp(a, b, 6) == 0;
+}
+
+bool bb_controller_resolve_identity(const uint8_t address[6], const uint8_t identity[6]) {
+    bool known = false;
+    critical_section_enter_blocking(&lock);
+    int transient = -1;
+    for (uint8_t i = 0; i < config_state.controller_count; ++i) {
+        if (address_equal(config_state.controllers[i].bluetooth_address, identity)) known = true;
+        if (address_equal(config_state.controllers[i].bluetooth_address, address)) transient = i;
+    }
+    if (!known && transient >= 0) {
+        memcpy(config_state.controllers[transient].bluetooth_address, identity, 6);
+        config_save_pending = true;
+        known = true;
+    }
+    critical_section_exit(&lock);
+    return known;
 }
 
 bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_id, uint16_t product_id, const char* name, uint8_t* out_index) {
@@ -792,7 +833,10 @@ bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_
             set_name(controller->name, sizeof(controller->name), name, "Bluetooth Controller");
             changed = true;
         }
-        if (!boot_multi) config_state.active_controller = index;
+        if (!boot_multi && config_state.active_controller != index) {
+            config_state.active_controller = index;
+            changed = true;
+        }
         if (!boot_multi || management_controller_index < 0) management_controller_index = index;
         if (changed) config_save_pending = true;
         ok = true;

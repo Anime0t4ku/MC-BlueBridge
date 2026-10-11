@@ -45,12 +45,18 @@ static uint8_t host_service_changed_range[] = {0x01, 0x00, 0xff, 0xff};
 static bool stack_ready;
 static bool scanning;
 static bool pairing;
+static bool classic_inquiry_active;
+static uint32_t classic_inquiry_retry_at;
 static bb_config_t remembered_cfg;
 static btstack_timer_source_t usb_watch_timer;
 static bool usb_was_ready;
 static uint32_t usb_lost_since;
 static uint32_t multi_reconnect_at;
-static uint8_t multi_reconnect_cursor;
+static uint8_t classic_reconnect_cursor;
+static bool ble_address_lookup_pending;
+static bd_addr_t ble_address_lookup_addr;
+static uint8_t ble_address_lookup_type;
+static uint32_t ble_address_lookup_at;
 typedef struct {
     uint32_t classic_attempt_started;
     bool classic_attempt_active;
@@ -180,13 +186,17 @@ static int slot_for_cid(uint16_t cid, unsigned kind) {
     }
     return -1;
 }
-static int slot_for_address(const uint8_t addr[6]) {
+static int slot_for_address_except(const uint8_t addr[6], int excluded) {
     for (int i = 0; i < BB_MAX_SLOTS; ++i) {
+        if (i == excluded) continue;
         bb_host_context_t* c = &host_slots[i];
-        if ((c->current_controller_index >= 0 && !memcmp(c->current_identity.address, addr, 6)) ||
+        if (((c->classic_hid_cid || c->classic_handle != HCI_CON_HANDLE_INVALID || c->le_handle != HCI_CON_HANDLE_INVALID) && (!memcmp(c->current_identity.address, addr, 6) || !memcmp(c->pending_addr, addr, 6))) ||
             ((c->classic_connecting || c->ble_connecting) && !memcmp(c->pending_addr, addr, 6))) return i;
     }
     return -1;
+}
+static int slot_for_address(const uint8_t addr[6]) {
+    return slot_for_address_except(addr, -1);
 }
 static bool any_setup(void) {
     for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
@@ -197,13 +207,9 @@ static bool any_setup(void) {
 static int free_slot(void) {
     for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_host_context_t* c = &host_slots[i];
-        if (c->current_controller_index < 0 && !c->classic_connecting && !c->ble_connecting && !c->classic_hid_cid && c->le_handle == HCI_CON_HANDLE_INVALID) return i;
+        if (c->current_controller_index < 0 && !c->classic_connecting && !c->ble_connecting && !c->classic_hid_cid && c->classic_handle == HCI_CON_HANDLE_INVALID && c->pending_classic_handle == HCI_CON_HANDLE_INVALID && c->le_handle == HCI_CON_HANDLE_INVALID) return i;
     }
     return -1;
-}
-static int setup_slot(void) {
-    for (int i = 0; i < BB_MAX_SLOTS; ++i) if (host_slots[i].ble_connecting || host_slots[i].classic_connecting) return i;
-    return free_slot();
 }
 static int route_hci(const uint8_t* packet, uint16_t size) {
     if (!bb_multi_mode()) return 0;
@@ -217,7 +223,7 @@ static int route_hci(const uint8_t* packet, uint16_t size) {
                 hid_subevent_incoming_connection_get_address(packet, addr);
                 int known = slot_for_address(addr);
                 if (known >= 0) return known;
-                int empty = any_setup() ? -1 : free_slot();
+                int empty = free_slot();
                 if (empty < 0) hid_host_decline_connection(hid_subevent_incoming_connection_get_hid_cid(packet));
                 return empty;
             }
@@ -232,10 +238,18 @@ static int route_hci(const uint8_t* packet, uint16_t size) {
             if (size < 9) return -1;
             reverse_bd_addr(packet + 3, addr);
             break;
+        case HCI_EVENT_USER_CONFIRMATION_REQUEST:
+            hci_event_user_confirmation_request_get_bd_addr(packet, addr);
+            break;
+        case HCI_EVENT_PIN_CODE_REQUEST:
+            hci_event_pin_code_request_get_bd_addr(packet, addr);
+            break;
         case HCI_EVENT_DISCONNECTION_COMPLETE:
             return slot_for_handle(hci_event_disconnection_complete_get_connection_handle(packet));
         case HCI_EVENT_META_GAP:
-            return setup_slot();
+            if (size < 4 || packet[2] != GAP_SUBEVENT_LE_CONNECTION_COMPLETE) return -1;
+            for (int i = 0; i < BB_MAX_SLOTS; ++i) if (host_slots[i].ble_connecting) return i;
+            return -1;
         case GAP_EVENT_INQUIRY_RESULT:
         case GAP_EVENT_ADVERTISING_REPORT:
         case GAP_EVENT_INQUIRY_COMPLETE:
@@ -243,7 +257,7 @@ static int route_hci(const uint8_t* packet, uint16_t size) {
         default: return 0;
     }
     int known = slot_for_address(addr);
-    return known >= 0 ? known : (any_setup() ? -1 : free_slot());
+    return known >= 0 ? known : free_slot();
 }
 
 #define classic_attempt_started (host_slots[bb_slot_current()].classic_attempt_started)
@@ -341,6 +355,7 @@ static int route_hci(const uint8_t* packet, uint16_t size) {
 
 static int sdp_owner;
 static void start_scans(void);
+static void start_classic_inquiry(void);
 static void stop_scans(void);
 static bool name_has(const char* name, const char* part);
 static void schedule_classic_reconnect(uint32_t delay_ms);
@@ -794,28 +809,20 @@ static const char* remembered_name(const uint8_t addr[6]) {
 static bool classic_reconnect_target(bd_addr_t addr, char* name, size_t name_size) {
     bb_config_get(&remembered_cfg);
     if (!remembered_cfg.controller_count || remembered_cfg.active_controller >= remembered_cfg.controller_count) return false;
-    const bb_controller_t* controller = &remembered_cfg.controllers[remembered_cfg.active_controller];
-    if (bb_multi_mode()) {
-        controller = NULL;
-        for (uint8_t i = 0; i < remembered_cfg.controller_count; ++i) {
-            uint8_t candidate_index = (uint8_t)((multi_reconnect_cursor + i) % remembered_cfg.controller_count);
-            const bb_controller_t* candidate = &remembered_cfg.controllers[candidate_index];
-            if (slot_for_address(candidate->bluetooth_address) >= 0 || candidate->native_vendor_id == 0x054c) continue;
-            bd_addr_t check;
-            memcpy(check, candidate->bluetooth_address, 6);
-            link_key_t key;
-            link_key_type_t type;
-            if (gap_get_link_key_for_bd_addr(check, key, &type)) { controller = candidate; multi_reconnect_cursor = (uint8_t)(candidate_index + 1); break; }
-        }
-        if (!controller) return false;
+    for (uint8_t i = 0; i < remembered_cfg.controller_count; ++i) {
+        uint8_t index = (uint8_t)((classic_reconnect_cursor + i) % remembered_cfg.controller_count);
+        const bb_controller_t* controller = &remembered_cfg.controllers[index];
+        if (slot_for_address(controller->bluetooth_address) >= 0 || reconnect_blocked(controller->bluetooth_address)) continue;
+        if (controller->native_vendor_id == 0x054c || name_has(controller->name, "dualsense") || name_has(controller->name, "wireless controller") || name_has(controller->name, "dualshock")) continue;
+        link_key_t key;
+        link_key_type_t type;
+        memcpy(addr, controller->bluetooth_address, 6);
+        if (!gap_get_link_key_for_bd_addr(addr, key, &type)) continue;
+        classic_reconnect_cursor = (uint8_t)(index + 1);
+        copy_name(name, name_size, controller->name);
+        return true;
     }
-    link_key_t key;
-    link_key_type_t type;
-    memcpy(addr, controller->bluetooth_address, 6);
-    if (!gap_get_link_key_for_bd_addr(addr, key, &type)) return false;
-    copy_name(name, name_size, controller->name);
-    if (controller->native_vendor_id == 0x054c || name_has(name, "dualsense") || name_has(name, "wireless controller") || name_has(name, "dualshock")) return false;
-    return true;
+    return false;
 }
 
 static void schedule_classic_reconnect(uint32_t delay_ms) {
@@ -873,7 +880,7 @@ static void request_next_classic_name(void) {
         classic_name_candidate_index++;
     }
     reset_classic_name_candidates();
-    if (pairing && scanning && !classic_connecting && !ble_connecting) gap_inquiry_start(5);
+    if (pairing && scanning) start_classic_inquiry();
 }
 
 static void adv_name(const uint8_t* data, uint8_t length, char* out, size_t out_size) {
@@ -911,6 +918,11 @@ static const char* nintendo_ble_name(uint16_t pid) {
     if (pid == 0x2069) return "Nintendo Switch 2 Pro Controller";
     if (pid == 0x2073) return "Nintendo GameCube Controller";
     return "Nintendo Controller";
+}
+
+static bool accept_ble_advertisement(const uint8_t addr[6], bd_addr_type_t type, bool hogp, bool custom_nintendo) {
+    if (hogp || custom_nintendo || remembered_address(addr)) return true;
+    return !pairing && type == BD_ADDR_TYPE_LE_RANDOM && (addr[0] & 0xc0u) == 0x40u;
 }
 
 static bool accept_candidate(const uint8_t addr[6], const char* name, bool protocol_hint) {
@@ -1004,13 +1016,28 @@ static void service_classic_identity(void) {
 }
 
 static void activate_controller(const uint8_t addr[6], uint8_t address_type, uint16_t vid, uint16_t pid, const char* name) {
+    bd_addr_t identity_addr;
+    memcpy(identity_addr, addr, 6);
+    if (le_handle != HCI_CON_HANDLE_INVALID) {
+        int index = sm_le_device_index(le_handle);
+        if (index >= 0) {
+            int identity_type;
+            bd_addr_t bonded_addr;
+            le_device_db_info(index, &identity_type, bonded_addr, NULL);
+            if (identity_type == BD_ADDR_TYPE_LE_PUBLIC || identity_type == BD_ADDR_TYPE_LE_RANDOM) {
+                bb_controller_resolve_identity(addr, bonded_addr);
+                memcpy(identity_addr, bonded_addr, 6);
+                address_type = (uint8_t)identity_type;
+            }
+        }
+    }
     uint16_t old_identity = bb_current_mister_identity();
     memset(&current_identity, 0, sizeof(current_identity));
-    memcpy(current_identity.address, addr, 6);
+    memcpy(current_identity.address, identity_addr, 6);
     current_identity.address_type = address_type;
     current_identity.vendor_id = vid;
     current_identity.product_id = pid;
-    const char* stored_name = remembered_name(addr);
+    const char* stored_name = remembered_name(identity_addr);
     const char* identity_name = name && name[0] ? name : stored_name;
     if ((!identity_name || !identity_name[0] || name_has(identity_name, "bluetooth controller")) && stored_name && stored_name[0]) identity_name = stored_name;
     current_identity.kind = bb_controller_identify(vid, pid, identity_name);
@@ -1022,7 +1049,19 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     if (vid == 0x2dc8 && pid == 0x3019) identity_name = "8BitDo 64";
     bb_controller_display_name(current_identity.kind, identity_name, current_identity.name, sizeof(current_identity.name));
     uint8_t controller_index = 0;
-    if (!bb_controller_activate_or_create(addr, vid, pid, current_identity.name, &controller_index)) return;
+    if (bb_multi_mode()) {
+        int slot = slot_for_address_except(identity_addr, bb_slot_current());
+        if (slot >= 0) {
+            if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
+            if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
+            return;
+        }
+    }
+    if (!bb_controller_activate_or_create(identity_addr, vid, pid, current_identity.name, &controller_index)) {
+        if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
+        if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
+        return;
+    }
     current_controller_index = controller_index;
     bb_driver_set_identity(&current_identity);
     if (current_identity.kind == BB_CONTROLLER_NSO_N64 && classic_hid_cid && !classic_switch_protocol) {
@@ -1043,10 +1082,8 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     }
     bb_state_set_controller(true, controller_index, current_identity.name);
     bb_state_set_scanning(false);
-    if (!bb_multi_mode() || free_slot() < 0) {
-        bb_state_set_pairing(false);
-        pairing = false;
-    }
+    bb_state_set_pairing(false);
+    pairing = false;
     classic_connecting = false;
     classic_attempt_active = false;
     pending_classic_handle = HCI_CON_HANDLE_INVALID;
@@ -1073,8 +1110,6 @@ static void controller_disconnected(void) {
     identity_query_pending = false;
     connected_name_request = false;
     reset_classic_name_candidates();
-    reconnect_block_until = 0;
-    memset(reconnect_block_addr, 0, sizeof(reconnect_block_addr));
     bb_input_state_t neutral;
     bb_input_clear(&neutral);
     bb_input_submit(&neutral);
@@ -1131,22 +1166,36 @@ static void controller_disconnected(void) {
     }
 }
 
-static void start_scans(void) {
-    if (!stack_ready || scanning || connection_in_progress() || free_slot() < 0) return;
-    scanning = true;
-    bb_state_set_scanning(true);
-    gap_set_scan_parameters(0, 48, 48);
-    gap_start_scan();
+static void start_classic_inquiry(void) {
+    if (!stack_ready || !pairing || !scanning || classic_inquiry_active || connection_in_progress() || free_slot() < 0) return;
+    uint32_t now = btstack_run_loop_get_time_ms();
+    if (classic_inquiry_retry_at && (int32_t)(now - classic_inquiry_retry_at) < 0) return;
+    if (gap_inquiry_start(5) == ERROR_CODE_SUCCESS) {
+        classic_inquiry_active = true;
+        classic_inquiry_retry_at = 0;
+    } else classic_inquiry_retry_at = now + 250u;
+}
 
-    if (pairing) gap_inquiry_start(5);
+static void start_scans(void) {
+    if (!stack_ready || connection_in_progress() || free_slot() < 0) return;
+    if (!scanning) {
+        scanning = true;
+        bb_state_set_scanning(true);
+        gap_set_scan_parameters(1, 48, 48);
+        gap_start_scan();
+    }
+    start_classic_inquiry();
 }
 
 static void stop_scans(void) {
-    if (!scanning) return;
+    bool was_scanning = scanning;
+    scanning = false;
+    classic_inquiry_active = false;
+    classic_inquiry_retry_at = 0;
+    bb_state_set_scanning(false);
+    if (!was_scanning) return;
     gap_stop_scan();
     gap_inquiry_stop();
-    scanning = false;
-    bb_state_set_scanning(false);
 }
 
 static void connect_classic(const uint8_t addr[6], const char* name) {
@@ -1471,6 +1520,25 @@ static void ble_identity_handler_impl(uint8_t packet_type, uint16_t channel, uin
 static void sm_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
+    if (packet_type == HCI_EVENT_PACKET && size >= 11 && ble_address_lookup_pending &&
+        (packet[0] == SM_EVENT_IDENTITY_RESOLVING_SUCCEEDED || packet[0] == SM_EVENT_IDENTITY_RESOLVING_FAILED)) {
+        bd_addr_t address;
+        sm_event_identity_resolving_failed_get_address(packet, address);
+        if (same_address(address, ble_address_lookup_addr)) {
+            ble_address_lookup_pending = false;
+            if (packet[0] == SM_EVENT_IDENTITY_RESOLVING_SUCCEEDED && size >= 20 && !connection_in_progress() && bb_usb_ready()) {
+                bd_addr_t identity;
+                sm_event_identity_resolving_succeeded_get_identity_address(packet, identity);
+                int slot = free_slot();
+                if (slot >= 0 && remembered_address(identity) && slot_for_address(identity) < 0) {
+                    bb_slot_enter((uint8_t)slot);
+                    if (!reconnect_blocked(identity)) connect_ble(address, ble_address_lookup_type, remembered_name(identity), false, false, 0, 0);
+                }
+            }
+            bb_slot_enter(previous);
+            return;
+        }
+    }
     int slot = bb_multi_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
@@ -1727,6 +1795,7 @@ static void classic_hid_event(uint8_t* packet) {
 static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
+    if (packet_type == HCI_EVENT_PACKET && size >= 2 && packet[0] == GAP_EVENT_INQUIRY_COMPLETE) classic_inquiry_active = false;
     int slot = bb_multi_mode() ? (route_hci(packet, size)) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
@@ -1752,11 +1821,7 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             bd_addr_t addr;
             hci_event_connection_request_get_bd_addr(packet, addr);
             const char* name = remembered_name(addr);
-            bool sony = name_has(name, "dualsense") || name_has(name, "dualshock");
-            for (uint8_t i = 0; i < remembered_cfg.controller_count; ++i) {
-                if (same_address(addr, remembered_cfg.controllers[i].bluetooth_address) && remembered_cfg.controllers[i].native_vendor_id == 0x054c) sony = true;
-            }
-            if (hci_event_connection_request_get_link_type(packet) == HCI_LINK_TYPE_ACL && sony &&
+            if (hci_event_connection_request_get_link_type(packet) == HCI_LINK_TYPE_ACL && (pairing || remembered_address(addr)) &&
                 !classic_connecting && !ble_connecting && current_controller_index < 0 && !reconnect_blocked(addr)) {
                 reset_classic_name_candidates();
                 memcpy(pending_addr, addr, sizeof(pending_addr));
@@ -1808,7 +1873,7 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
         case GAP_EVENT_INQUIRY_COMPLETE:
             if (pairing && scanning && !classic_connecting && !ble_connecting) {
                 if (classic_name_candidate_count) request_next_classic_name();
-                else gap_inquiry_start(5);
+                else start_classic_inquiry();
             }
             break;
         case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE: {
@@ -1862,11 +1927,20 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             bool gamecube = adv_pid == 0x2073 || name_has(name, "gamecube");
             bool switch2_pro = adv_pid == 0x2069 || name_has(name, "switch 2 pro") || name_has(name, "pro controller 2");
             bool custom_nintendo = nso_new || nintendo_new || (!hogp && (switch2_pro || gamecube));
-            if (!hogp && !custom_nintendo) break;
+            uint8_t address_type = gap_event_advertising_report_get_address_type(packet);
+            if (!accept_ble_advertisement(addr, address_type, hogp, custom_nintendo)) break;
             if (custom_nintendo) {
                 if (!remembered_address(addr) && !pairing) break;
                 if (!name[0]) copy_name(name, sizeof(name), nintendo_ble_name(adv_pid));
             } else if (!accept_candidate(addr, name, hogp)) {
+                uint8_t type = gap_event_advertising_report_get_address_type(packet);
+                if (!pairing && !ble_address_lookup_pending && !reconnect_blocked(addr) && type == BD_ADDR_TYPE_LE_RANDOM && (addr[0] & 0xc0u) == 0x40u) {
+                    memcpy(ble_address_lookup_addr, addr, 6);
+                    ble_address_lookup_type = type;
+                    ble_address_lookup_at = btstack_run_loop_get_time_ms();
+                    ble_address_lookup_pending = true;
+                    if (sm_address_resolution_lookup(type, addr)) ble_address_lookup_pending = false;
+                }
                 break;
             }
             connect_ble(addr, gap_event_advertising_report_get_address_type(packet), name, custom_nintendo, gamecube, adv_vid, adv_pid);
@@ -1911,7 +1985,8 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
             hci_con_handle_t handle = hci_event_disconnection_complete_get_connection_handle(packet);
             if ((le_handle != HCI_CON_HANDLE_INVALID && handle == le_handle) ||
-                (classic_handle != HCI_CON_HANDLE_INVALID && handle == classic_handle)) controller_disconnected();
+                (classic_handle != HCI_CON_HANDLE_INVALID && handle == classic_handle) ||
+                (pending_classic_handle != HCI_CON_HANDLE_INVALID && handle == pending_classic_handle)) controller_disconnected();
             break;
         }
         default:
@@ -2065,7 +2140,7 @@ static void service_slot(void) {
         if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
         controller_disconnected();
     }
-    if (classic_reconnect_at && (int32_t)(now - classic_reconnect_at) >= 0) {
+    if (!bb_multi_mode() && classic_reconnect_at && (int32_t)(now - classic_reconnect_at) >= 0) {
         classic_reconnect_at = 0;
         bb_runtime_state_t state;
         bb_state_get(&state);
@@ -2076,8 +2151,9 @@ static void service_slot(void) {
                 bd_addr_t addr;
                 char name[BB_MAX_NAME];
                 if (classic_reconnect_target(addr, name, sizeof(name))) connect_classic(addr, name);
+                else schedule_classic_reconnect(3000u);
             }
-        }
+        } else if (!state.controller_connected) schedule_classic_reconnect(3000u);
     }
     if (manual_disconnect_pending && (int32_t)(now - manual_disconnect_at) >= 0) {
         manual_disconnect_pending = false;
@@ -2105,6 +2181,7 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
     }
     bool ready = bb_usb_ready();
     uint32_t now = btstack_run_loop_get_time_ms();
+    if (ble_address_lookup_pending && (uint32_t)(now - ble_address_lookup_at) >= 3000u) ble_address_lookup_pending = false;
     if (ready) { usb_was_ready = true; usb_lost_since = 0; }
     else if (usb_was_ready) {
         if (!usb_lost_since) usb_lost_since = now;
@@ -2121,6 +2198,7 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
         bb_slot_enter(i);
         service_slot();
     }
+    if (pairing && !connection_in_progress() && free_slot() >= 0) start_scans();
     if (bb_multi_mode() && !pairing && !connection_in_progress() && bb_usb_ready() && (int32_t)(now - multi_reconnect_at) >= 0) {
         int slot = free_slot();
         if (slot >= 0) {
@@ -2170,6 +2248,8 @@ static void setup_host_att_server(void) {
 void bb_bt_host_init(void) {
     reset_classic_name_candidates();
     bb_driver_reset();
+    bb_config_get(&remembered_cfg);
+    classic_reconnect_cursor = remembered_cfg.active_controller;
     const btstack_tlv_t* tlv_impl = NULL;
     void* tlv_context = NULL;
     btstack_tlv_get_instance(&tlv_impl, &tlv_context);
@@ -2242,13 +2322,9 @@ static void stop_pairing_impl(void) {
     bb_state_set_pairing(false);
 
     gap_discoverable_control(1);
-    bb_runtime_state_t state;
-    bb_state_get(&state);
-    if (!state.controller_connected) {
-        stop_scans();
-        start_scans();
-        schedule_classic_reconnect(3000u);
-    }
+    stop_scans();
+    start_scans();
+    schedule_classic_reconnect(3000u);
 }
 
 static void forget_all_impl(void) {
@@ -2377,8 +2453,18 @@ bool bb_bt_host_diagnostics(char* out, size_t size) {
         name_hex[i * 2 + 1] = digits[value & 15];
     }
     name_hex[name_length * 2] = 0;
-    snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s,\"security_retry\":%s,\"secure_connections_only\":%s}",
-        name_hex, ble_key_minimum, ble_authentication, ble_pairing_reason, ble_stage, ble_failed_stage, ble_setup_status, (unsigned long)ble_attempt_count,
+    char identity_hex[13];
+    char transport_hex[13];
+    for (size_t i = 0; i < 6; ++i) {
+        identity_hex[i * 2] = digits[current_identity.address[i] >> 4];
+        identity_hex[i * 2 + 1] = digits[current_identity.address[i] & 15];
+        transport_hex[i * 2] = digits[pending_addr[i] >> 4];
+        transport_hex[i * 2 + 1] = digits[pending_addr[i] & 15];
+    }
+    identity_hex[12] = 0;
+    transport_hex[12] = 0;
+    snprintf(out, size, "{\"peer_name_hex\":\"%s\",\"identity_address\":\"%s\",\"transport_address\":\"%s\",\"slot\":%u,\"key_minimum\":%u,\"authentication\":%u,\"pairing_reason\":%d,\"ble_stage\":\"%s\",\"failed_stage\":\"%s\",\"status\":%d,\"attempts\":%lu,\"ble_connecting\":%s,\"le_handle\":%u,\"hid_cid\":%u,\"controller_index\":%d,\"classic_connecting\":%s,\"classic_attempt_active\":%s,\"security_retry\":%s,\"secure_connections_only\":%s}",
+        name_hex, identity_hex, transport_hex, bb_slot_current(), ble_key_minimum, ble_authentication, ble_pairing_reason, ble_stage, ble_failed_stage, ble_setup_status, (unsigned long)ble_attempt_count,
         ble_connecting ? "true" : "false", le_handle, hids_cid, current_controller_index,
         classic_connecting ? "true" : "false", classic_attempt_active ? "true" : "false", ble_security_retry ? "true" : "false", ble_secure_connections_only ? "true" : "false");
     return true;

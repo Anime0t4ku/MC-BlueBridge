@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLUEBRIDGE_VERSION "1.0.0-beta-57"
+#define BLUEBRIDGE_VERSION "1.0.0-beta-59"
 #define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=12"
 #define BLUEBRIDGE_PROTOCOL_VERSION 2
 #define BB_CONFIG_SCHEMA 12
@@ -198,6 +198,7 @@ bool bb_profile_set_turbo_control(uint8_t profile_index, uint8_t enabled, uint8_
 bool bb_profile_set_separate_mapping(uint8_t profile_index);
 bool bb_profile_share_mapping(uint8_t profile_index, uint8_t target_index);
 bool bb_controller_forget(uint8_t index, uint8_t address_out[6]);
+bool bb_controller_resolve_identity(const uint8_t address[6], const uint8_t identity[6]);
 bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_id, uint16_t product_id, const char* name, uint8_t* out_index);
 bool bb_controller_update_identity(uint8_t index, uint16_t vendor_id, uint16_t product_id, const char* name);
 bool bb_controller_select(uint8_t index);
