@@ -3,13 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLUEBRIDGE_VERSION "1.0.1-beta-72"
-#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=12"
+#define BLUEBRIDGE_VERSION "1.0.0-RC-1"
+#define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=13"
 #define BLUEBRIDGE_PROTOCOL_VERSION 2
-#define BB_CONFIG_SCHEMA 12
+#define BB_CONFIG_SCHEMA 13
 #define BB_MAX_NAME 32
 #define BB_MAX_PROFILE_NAME 24
 #define BB_MAX_CONTROLLERS 8
+#define BB_MAX_BLOCKED_DEVICES 16
 #define BB_MAX_SLOTS 2
 #define BB_MAX_PROFILES 8
 #define BB_BUTTON_COUNT 26
@@ -85,6 +86,11 @@ typedef struct __attribute__((packed)) {
 } bb_controller_t;
 
 typedef struct __attribute__((packed)) {
+    uint8_t bluetooth_address[6];
+    char name[BB_MAX_NAME];
+} bb_blocked_device_t;
+
+typedef struct __attribute__((packed)) {
     uint32_t schema;
     uint8_t output_mode;
     uint8_t controller_count;
@@ -97,8 +103,11 @@ typedef struct __attribute__((packed)) {
     char adapter_name[BB_MAX_NAME];
     uint8_t multi_controller;
     uint8_t single_output_mode;
+    uint8_t blocked_device_count;
+    bb_blocked_device_t blocked_devices[BB_MAX_BLOCKED_DEVICES];
 } bb_config_t;
 
+#define BB_CONFIG_V12_SIZE offsetof(bb_config_t, blocked_device_count)
 #define BB_CONFIG_V11_SIZE offsetof(bb_config_t, multi_controller)
 bool bb_multi_mode(void);
 bool bb_multi_mode_set(bool enabled);
@@ -198,6 +207,11 @@ bool bb_profile_set_turbo_control(uint8_t profile_index, uint8_t enabled, uint8_
 bool bb_profile_set_separate_mapping(uint8_t profile_index);
 bool bb_profile_share_mapping(uint8_t profile_index, uint8_t target_index);
 bool bb_controller_forget(uint8_t index, uint8_t address_out[6]);
+bool bb_blocked_device_add(const uint8_t address[6], const char* name);
+bool bb_blocked_device_remove(const uint8_t address[6]);
+bool bb_blocked_device_contains(const uint8_t address[6]);
+uint8_t bb_blocked_devices_get(bb_blocked_device_t* out, uint8_t max_count);
+bool bb_controller_address(uint8_t index, uint8_t out[6]);
 bool bb_controller_resolve_identity(const uint8_t address[6], const uint8_t identity[6]);
 bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_id, uint16_t product_id, const char* name, uint8_t* out_index);
 bool bb_controller_update_identity(uint8_t index, uint16_t vendor_id, uint16_t product_id, const char* name);

@@ -90,6 +90,42 @@ static int shared_with_index(const bb_controller_t* controller, uint8_t index) {
     return -1;
 }
 
+static int hex_value(char c);
+static bool decode_hex(const char* src, uint8_t* dst, size_t max, size_t* written);
+
+static void format_address(const uint8_t address[6], char out[18]) {
+    snprintf(out, 18, "%02X:%02X:%02X:%02X:%02X:%02X", address[0], address[1], address[2], address[3], address[4], address[5]);
+}
+
+static bool parse_address(const char* text, uint8_t out[6]) {
+    if (!text || !out) return false;
+    char hex[13];
+    size_t n = 0;
+    for (const char* p = text; *p; ++p) {
+        if (*p == ':' || *p == '-') continue;
+        if (n >= 12 || hex_value(*p) < 0) return false;
+        hex[n++] = *p;
+    }
+    if (n != 12) return false;
+    hex[12] = 0;
+    size_t written = 0;
+    return decode_hex(hex, out, 6, &written) && written == 6;
+}
+
+static void send_blocked_devices(const char* id) {
+    bb_blocked_device_t entries[BB_MAX_BLOCKED_DEVICES];
+    uint8_t count = bb_blocked_devices_get(entries, BB_MAX_BLOCKED_DEVICES);
+    char out[2048];
+    size_t pos = (size_t)snprintf(out, sizeof(out), "{\"blocked_devices\":[");
+    for (uint8_t i = 0; i < count && pos + 120 < sizeof(out); ++i) {
+        char address[18];
+        format_address(entries[i].bluetooth_address, address);
+        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"id\":\"%s\",\"name\":\"%s\"}", i ? "," : "", address, entries[i].name);
+    }
+    snprintf(out + pos, sizeof(out) - pos, "]}");
+    send_ok(id, out);
+}
+
 static void send_controllers(const char* id) {
     bb_config_t cfg;
     bb_runtime_state_t runtime;
@@ -103,7 +139,9 @@ static void send_controllers(const char* id) {
         char display[BB_MAX_NAME];
         bb_controller_name_get(i, display, sizeof(display));
         bb_controller_kind_t kind = bb_controller_identify(c->native_vendor_id, c->native_product_id, c->name);
-        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"name\":\"%s\",\"model_name\":\"%s\",\"custom_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s,\"slot\":%d}", i ? "," : "", i, (unsigned long)c->id, display, c->name, cfg.controller_names[i], (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, bb_controller_slot(i) >= 0 ? "true" : "false", bb_controller_slot(i));
+        char bluetooth_id[18];
+        format_address(c->bluetooth_address, bluetooth_id);
+        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"bluetooth_id\":\"%s\",\"name\":\"%s\",\"model_name\":\"%s\",\"custom_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s,\"slot\":%d}", i ? "," : "", i, (unsigned long)c->id, bluetooth_id, display, c->name, cfg.controller_names[i], (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, bb_controller_slot(i) >= 0 ? "true" : "false", bb_controller_slot(i));
     }
     snprintf(out + pos, sizeof(out) - pos, "]}");
     send_ok(id, out);
@@ -230,7 +268,7 @@ static void handle_command(char* text) {
         bb_adapter_name_get(adapter_name, sizeof(adapter_name));
         bb_adapter_custom_name_get(custom_name, sizeof(custom_name));
         pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
         send_ok(id, out);
         return;
     }
@@ -301,6 +339,32 @@ static void handle_command(char* text) {
     }
     if (!strcmp(cmd, "CONTROLLERS")) {
         send_controllers(id);
+        return;
+    }
+    if (!strcmp(cmd, "BLOCKED_DEVICES")) {
+        send_blocked_devices(id);
+        return;
+    }
+    if (!strcmp(cmd, "DEVICE_BLOCK")) {
+        char* value = next_field(&cursor);
+        char* name = next_field(&cursor);
+        uint8_t address[6];
+        if (!parse_address(value, address)) { send_err(id, "device_id"); return; }
+        bb_config_t cfg;
+        bb_config_get(&cfg);
+        int controller_index = -1;
+        for (uint8_t i = 0; i < cfg.controller_count; ++i) if (memcmp(cfg.controllers[i].bluetooth_address, address, 6) == 0) { controller_index = i; break; }
+        if (!bb_blocked_device_add(address, name ? name : "Bluetooth Device")) { send_err(id, "blacklist_full"); return; }
+        if (controller_index >= 0) bb_platform_forget_controller((uint8_t)controller_index);
+        else bb_bt_host_forget_device(address);
+        send_ok(id, "blocked");
+        return;
+    }
+    if (!strcmp(cmd, "DEVICE_UNBLOCK")) {
+        char* value = next_field(&cursor);
+        uint8_t address[6];
+        if (!parse_address(value, address) || !bb_blocked_device_remove(address)) send_err(id, "device_id");
+        else send_ok(id, "unblocked");
         return;
     }
     if (!strcmp(cmd, "CONTROLLER_FORGET")) {
@@ -521,7 +585,7 @@ static void handle_command(char* text) {
         char* size = next_field(&cursor);
         char* checksum = next_field(&cursor);
         int schema_value = schema ? atoi(schema) : 0;
-        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11))) {
+        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value == 12 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V12_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11 && schema_value != 12))) {
             import_active = false;
             send_err(id, "config_header");
             return;

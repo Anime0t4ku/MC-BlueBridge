@@ -33,6 +33,7 @@ Bluetooth controllers connect to a Pico 2 W and are translated into a normalized
 - Persistent controller-based profile configuration
 - Remembered controllers matched by Bluetooth identity with native VID/PID metadata when available
 - Multiple profiles per controller with button remapping, duplication, deadzones, axis inversion, turbo, and macros
+- Persistent Bluetooth device blacklist with visible Bluetooth IDs and explicit block/unblock management
 - Separate MiSTer controller mapping per profile by default
 - Optional shared MiSTer mapping between profiles of the same controller
 - Configuration export/import through the CDC protocol

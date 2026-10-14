@@ -1013,12 +1013,14 @@ static const char* nintendo_ble_name(uint16_t pid) {
 }
 
 static bool accept_ble_advertisement(const uint8_t addr[6], bd_addr_type_t type, bool hogp, bool custom_nintendo) {
+    if (bb_blocked_device_contains(addr)) return false;
     if (hogp || custom_nintendo || remembered_address(addr)) return true;
     return !pairing && type == BD_ADDR_TYPE_LE_RANDOM && (addr[0] & 0xc0u) == 0x40u;
 }
 
 static bool accept_candidate(const uint8_t addr[6], const char* name, bool protocol_hint) {
     if (!bb_usb_ready()) return false;
+    if (bb_blocked_device_contains(addr)) return false;
     if (reconnect_blocked(addr)) return false;
     if (bb_multi_mode() && slot_for_address(addr) >= 0) return false;
     if (remembered_address(addr)) return true;
@@ -1123,6 +1125,12 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
                 address_type = (uint8_t)identity_type;
             }
         }
+    }
+    if (bb_blocked_device_contains(identity_addr) || bb_blocked_device_contains(addr)) {
+        if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
+        if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
+        bb_bt_host_forget_device(identity_addr);
+        return;
     }
     uint16_t old_identity = bb_current_mister_identity();
     memset(&current_identity, 0, sizeof(current_identity));
@@ -1671,7 +1679,7 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
                 bd_addr_t identity;
                 sm_event_identity_resolving_succeeded_get_identity_address(packet, identity);
                 int slot = free_slot();
-                if (slot >= 0 && remembered_address(identity) && slot_for_address(identity) < 0) {
+                if (slot >= 0 && !bb_blocked_device_contains(identity) && remembered_address(identity) && slot_for_address(identity) < 0) {
                     bb_slot_enter((uint8_t)slot);
                     if (!reconnect_blocked(identity)) connect_ble(address, ble_address_lookup_type, remembered_name(identity), false, false, 0, 0);
                 }

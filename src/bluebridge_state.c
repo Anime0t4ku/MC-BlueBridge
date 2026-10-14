@@ -142,7 +142,7 @@ void bb_state_init(void) {
     }
     if (!bb_config_load(&config_state)) {
         init_defaults(&config_state);
-    } else if (config_state.schema == 8 || config_state.schema == 9 || config_state.schema == 10 || config_state.schema == 11) {
+    } else if (config_state.schema == 8 || config_state.schema == 9 || config_state.schema == 10 || config_state.schema == 11 || config_state.schema == 12) {
         config_state.schema = BB_CONFIG_SCHEMA;
         if (config_state.output_mode < BB_OUTPUT_MISTER || config_state.output_mode > BB_OUTPUT_SWITCH) config_state.output_mode = BB_OUTPUT_MISTER;
         config_save_pending = true;
@@ -785,6 +785,80 @@ static bool address_equal(const uint8_t a[6], const uint8_t b[6]) {
     return memcmp(a, b, 6) == 0;
 }
 
+static bool address_is_zero(const uint8_t address[6]) {
+    static const uint8_t zero[6] = {0};
+    return address_equal(address, zero);
+}
+
+bool bb_blocked_device_contains(const uint8_t address[6]) {
+    if (!address || address_is_zero(address)) return false;
+    bool found = false;
+    critical_section_enter_blocking(&lock);
+    for (uint8_t i = 0; i < config_state.blocked_device_count; ++i) {
+        if (address_equal(config_state.blocked_devices[i].bluetooth_address, address)) { found = true; break; }
+    }
+    critical_section_exit(&lock);
+    return found;
+}
+
+bool bb_blocked_device_add(const uint8_t address[6], const char* name) {
+    if (!address || address_is_zero(address)) return false;
+    bool ok = false;
+    critical_section_enter_blocking(&lock);
+    for (uint8_t i = 0; i < config_state.blocked_device_count; ++i) {
+        if (address_equal(config_state.blocked_devices[i].bluetooth_address, address)) {
+            if (name && name[0]) set_name(config_state.blocked_devices[i].name, sizeof(config_state.blocked_devices[i].name), name, "Bluetooth Device");
+            config_save_pending = true;
+            ok = true;
+            break;
+        }
+    }
+    if (!ok && config_state.blocked_device_count < BB_MAX_BLOCKED_DEVICES) {
+        bb_blocked_device_t* entry = &config_state.blocked_devices[config_state.blocked_device_count++];
+        memset(entry, 0, sizeof(*entry));
+        memcpy(entry->bluetooth_address, address, 6);
+        set_name(entry->name, sizeof(entry->name), name, "Bluetooth Device");
+        config_save_pending = true;
+        ok = true;
+    }
+    critical_section_exit(&lock);
+    return ok;
+}
+
+bool bb_blocked_device_remove(const uint8_t address[6]) {
+    if (!address) return false;
+    bool ok = false;
+    critical_section_enter_blocking(&lock);
+    for (uint8_t i = 0; i < config_state.blocked_device_count; ++i) {
+        if (!address_equal(config_state.blocked_devices[i].bluetooth_address, address)) continue;
+        for (uint8_t j = i; j + 1 < config_state.blocked_device_count; ++j) config_state.blocked_devices[j] = config_state.blocked_devices[j + 1];
+        memset(&config_state.blocked_devices[config_state.blocked_device_count - 1], 0, sizeof(config_state.blocked_devices[0]));
+        config_state.blocked_device_count--;
+        config_save_pending = true;
+        ok = true;
+        break;
+    }
+    critical_section_exit(&lock);
+    return ok;
+}
+
+uint8_t bb_blocked_devices_get(bb_blocked_device_t* out, uint8_t max_count) {
+    critical_section_enter_blocking(&lock);
+    uint8_t count = config_state.blocked_device_count < max_count ? config_state.blocked_device_count : max_count;
+    if (out && count) memcpy(out, config_state.blocked_devices, count * sizeof(*out));
+    critical_section_exit(&lock);
+    return count;
+}
+
+bool bb_controller_address(uint8_t index, uint8_t out[6]) {
+    if (!out) return false;
+    bool ok = false;
+    critical_section_enter_blocking(&lock);
+    if (index < config_state.controller_count) { memcpy(out, config_state.controllers[index].bluetooth_address, 6); ok = true; }
+    critical_section_exit(&lock);
+    return ok;
+}
+
 bool bb_controller_resolve_identity(const uint8_t address[6], const uint8_t identity[6]) {
     bool known = false;
     critical_section_enter_blocking(&lock);
@@ -940,7 +1014,7 @@ const char* bb_output_mode_name(bb_output_mode_t mode) {
 }
 
 bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
-    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8 && cfg->schema != 9 && cfg->schema != 10 && cfg->schema != 11) || bb_config_checksum(cfg) != checksum) return false;
+    if (!cfg || (cfg->schema != BB_CONFIG_SCHEMA && cfg->schema != 8 && cfg->schema != 9 && cfg->schema != 10 && cfg->schema != 11 && cfg->schema != 12) || bb_config_checksum(cfg) != checksum) return false;
     if (cfg->controller_count > BB_MAX_CONTROLLERS) return false;
     if (cfg->controller_count && cfg->active_controller >= cfg->controller_count) return false;
     for (uint8_t i = 0; i < cfg->controller_count; ++i) {
@@ -950,6 +1024,7 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
     bb_config_t value = *cfg;
     value.schema = BB_CONFIG_SCHEMA;
     if (cfg->schema < 11) memset(value.adapter_name, 0, sizeof(value.adapter_name));
+    if (cfg->schema < 13) { value.blocked_device_count = 0; memset(value.blocked_devices, 0, sizeof(value.blocked_devices)); }
     value.adapter_name[BB_MAX_NAME - 1] = 0;
     char clean_adapter_name[BB_MAX_NAME] = {0};
     set_name(clean_adapter_name, sizeof(clean_adapter_name), value.adapter_name, "");
@@ -961,7 +1036,7 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
         memcpy(value.controller_names[i], clean, sizeof(clean));
     }
     if (value.output_mode < BB_OUTPUT_MISTER || value.output_mode > BB_OUTPUT_SWITCH) value.output_mode = BB_OUTPUT_MISTER;
-    if (value.multi_controller > 1) return false;
+    if (value.multi_controller > 1 || value.blocked_device_count > BB_MAX_BLOCKED_DEVICES) return false;
     if (value.multi_controller) value.output_mode = BB_OUTPUT_MISTER;
     if (value.multi_controller != boot_multi) mode_restart = true;
     bb_config_set(&value, true);
