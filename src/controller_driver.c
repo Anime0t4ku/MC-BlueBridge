@@ -1,5 +1,6 @@
 #include "controller_driver.h"
 #include "bluebridge_state.h"
+#include "usb_device.h"
 #include "btstack.h"
 #include <string.h>
 #include <stdio.h>
@@ -1294,6 +1295,7 @@ static bool parse_8bitdo_arcade(const uint8_t* report, uint16_t length) {
 }
 
 void bb_driver_reset(void) {
+    bb_usb_set_press_latch(false);
     memset(&identity, 0, sizeof(identity));
     hid_descriptor = NULL;
     hid_descriptor_len = 0;
@@ -1328,6 +1330,7 @@ void bb_driver_set_identity(const bb_controller_identity_t* value) {
     if (!preserve_battery) have_early_arcade_battery_report = false;
     if (value) identity = *value;
     else memset(&identity, 0, sizeof(identity));
+    bb_usb_set_press_latch(identity.kind == BB_CONTROLLER_DUALSENSE || identity.kind == BB_CONTROLLER_DUALSENSE_EDGE);
     memset(eightbitdo_axis_roles, 0, sizeof(eightbitdo_axis_roles));
     eightbitdo_axis_roles_ready = false;
     memset(switch2_cal_sum, 0, sizeof(switch2_cal_sum));

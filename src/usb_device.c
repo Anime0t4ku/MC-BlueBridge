@@ -14,20 +14,80 @@
 #include <string.h>
 
 static critical_section_t usb_lock;
-static bb_gamepad_report_t pending_slots[BB_MAX_SLOTS];
+static volatile bool usb_lock_ready;
+#define BB_USB_QUEUE_DEPTH 8
+typedef struct {
+    bb_gamepad_report_t reports[BB_USB_QUEUE_DEPTH];
+    uint8_t head;
+    uint8_t count;
+} bb_usb_queue_t;
+static bb_usb_queue_t usb_queues[BB_MAX_SLOTS];
+static bb_gamepad_report_t latest_slots[BB_MAX_SLOTS];
+static bool press_latch_enabled[BB_MAX_SLOTS];
+static uint16_t press_latched_buttons[BB_MAX_SLOTS];
+static uint16_t press_previous_buttons[BB_MAX_SLOTS];
 static uint8_t usb_slot;
-#define pending pending_slots[usb_slot]
-static bool dirty_slots[BB_MAX_SLOTS];
-#define dirty dirty_slots[usb_slot]
 static bool reenumerate;
 static volatile bool usb_mounted;
 static uint32_t switch_last_send;
 
+static bool same_digital_state(const bb_gamepad_report_t* a, const bb_gamepad_report_t* b) {
+    return a->buttons == b->buttons && a->hat == b->hat;
+}
+
+static bool queue_push_locked(uint8_t slot, const bb_gamepad_report_t* report) {
+    bb_usb_queue_t* q = &usb_queues[slot];
+    latest_slots[slot] = *report;
+    if (!usb_mounted) {
+        q->head = 0;
+        q->count = 1;
+        q->reports[0] = *report;
+        return false;
+    }
+    if (q->count) {
+        uint8_t last = (uint8_t)((q->head + q->count - 1u) % BB_USB_QUEUE_DEPTH);
+        if (same_digital_state(&q->reports[last], report)) {
+            q->reports[last] = *report;
+            return false;
+        }
+    }
+    bool overflow = q->count == BB_USB_QUEUE_DEPTH;
+    if (overflow) {
+        q->head = (uint8_t)((q->head + 1u) % BB_USB_QUEUE_DEPTH);
+        --q->count;
+    }
+    uint8_t tail = (uint8_t)((q->head + q->count) % BB_USB_QUEUE_DEPTH);
+    q->reports[tail] = *report;
+    ++q->count;
+    return overflow;
+}
+
 void bb_usb_submit(const bb_gamepad_report_t* report) {
-    critical_section_enter_blocking(&usb_lock);
     uint8_t slot = bb_slot_current();
-    pending_slots[slot] = *report;
-    dirty_slots[slot] = true;
+    bool overflow;
+    critical_section_enter_blocking(&usb_lock);
+    if (press_latch_enabled[slot]) {
+        uint16_t buttons = report->buttons;
+        press_latched_buttons[slot] |= (uint16_t)(buttons & (uint16_t)~press_previous_buttons[slot]);
+        press_previous_buttons[slot] = buttons;
+    }
+    overflow = queue_push_locked(slot, report);
+    critical_section_exit(&usb_lock);
+    if (overflow) bb_state_note_slot_usb_report(slot, false);
+}
+
+void bb_usb_set_press_latch(bool enabled) {
+    uint8_t slot = bb_slot_current();
+    if (!usb_lock_ready) {
+        press_latch_enabled[slot] = enabled;
+        press_latched_buttons[slot] = 0;
+        press_previous_buttons[slot] = 0;
+        return;
+    }
+    critical_section_enter_blocking(&usb_lock);
+    press_latch_enabled[slot] = enabled;
+    press_latched_buttons[slot] = 0;
+    press_previous_buttons[slot] = 0;
     critical_section_exit(&usb_lock);
 }
 
@@ -124,15 +184,25 @@ static void send_pending(void) {
     bb_output_mode_t mode = bb_output_mode();
     if (mode == BB_OUTPUT_XINPUT ? !bb_xinput_ready() : !tud_hid_n_ready(usb_slot)) return;
     bb_gamepad_report_t report;
+    uint16_t latched_for_send = 0;
     bool send = false;
+    bool queued = false;
     critical_section_enter_blocking(&usb_lock);
-    if (dirty) {
-        report = pending;
-        dirty = false;
+    bb_usb_queue_t* q = &usb_queues[usb_slot];
+    if (q->count) {
+        report = q->reports[q->head];
+        q->head = (uint8_t)((q->head + 1u) % BB_USB_QUEUE_DEPTH);
+        --q->count;
         send = true;
+        queued = true;
     } else if (mode == BB_OUTPUT_SWITCH && (uint32_t)(to_ms_since_boot(get_absolute_time()) - switch_last_send) >= 15u) {
-        report = pending;
+        report = latest_slots[usb_slot];
         send = true;
+    }
+    if (send && press_latch_enabled[usb_slot]) {
+        latched_for_send = press_latched_buttons[usb_slot];
+        report.buttons |= latched_for_send;
+        press_latched_buttons[usb_slot] &= (uint16_t)~latched_for_send;
     }
     critical_section_exit(&usb_lock);
     if (!send) return;
@@ -154,9 +224,19 @@ static void send_pending(void) {
         ok = tud_hid_n_report(usb_slot, REPORT_ID_GAMEPAD, &gamepad, sizeof(gamepad));
     }
     bb_state_note_slot_usb_report(usb_slot, ok);
-    if (!ok) {
+    if (!ok && latched_for_send) {
         critical_section_enter_blocking(&usb_lock);
-        dirty = true;
+        press_latched_buttons[usb_slot] |= latched_for_send;
+        critical_section_exit(&usb_lock);
+    }
+    if (!ok && queued) {
+        critical_section_enter_blocking(&usb_lock);
+        q = &usb_queues[usb_slot];
+        if (q->count < BB_USB_QUEUE_DEPTH) {
+            q->head = (uint8_t)((q->head + BB_USB_QUEUE_DEPTH - 1u) % BB_USB_QUEUE_DEPTH);
+            q->reports[q->head] = report;
+            ++q->count;
+        }
         critical_section_exit(&usb_lock);
     }
 }
@@ -195,6 +275,7 @@ static void handle_reenumeration(void) {
 void bb_usb_core1(void) {
     flash_safe_execute_core_init();
     critical_section_init(&usb_lock);
+    usb_lock_ready = true;
     tusb_init();
     while (true) {
         if (bb_output_mode() == BB_OUTPUT_MISTER) {
@@ -223,7 +304,11 @@ void tud_mount_cb(void) {
     usb_mounted = true;
     bb_state_set_usb_ready(true);
     critical_section_enter_blocking(&usb_lock);
-    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) dirty_slots[i] = true;
+    for (unsigned i = 0; i < BB_MAX_SLOTS; ++i) {
+        usb_queues[i].head = 0;
+        usb_queues[i].count = 1;
+        usb_queues[i].reports[0] = latest_slots[i];
+    }
     critical_section_exit(&usb_lock);
 }
 

@@ -4,6 +4,7 @@
 
 void bb_usb_core1(void);
 void bb_usb_submit(const bb_gamepad_report_t* report);
+void bb_usb_set_press_latch(bool enabled);
 bool bb_usb_ready(void);
 void bb_usb_request_reenumeration(void);
 void bb_usb_service_pending(void);

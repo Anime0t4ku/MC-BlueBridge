@@ -1,126 +1,350 @@
 # MC BlueBridge
 
-## Experimental multi-controller mode (beta-60)
+MC BlueBridge turns a **Raspberry Pi Pico 2 W** into a low-latency Bluetooth controller adapter designed primarily for **MiSTer**, with additional support for PC, Nintendo Switch and Nintendo Switch 2.
 
-Single-controller mode remains the default. Companion Remote v4.0.4 adds a controller-mode selector to its BlueBridge page. Switching modes restarts the adapter and preserves its stored controllers and profiles. When returning to single mode, the selected connected controller becomes the preferred reconnect target; otherwise the first connected controller is used, or the existing preference is kept when none are connected.
+Controllers connect to BlueBridge over Bluetooth, while BlueBridge presents them to the host as a wired USB controller. Controller-specific Bluetooth protocols are handled internally, giving you one consistent system for pairing, profiles, remapping and customization.
 
-Multi-controller mode exposes two MiSTer USB gamepad interfaces under one fixed USB identity. Each connected controller uses its own active profile, button mappings, analog tuning and supported rumble. Turbo and macros are bypassed, with their saved settings preserved. Per-profile USB identities apply only in single-controller mode. The previously selected single-mode USB output is restored when multi mode is disabled.
+MC BlueBridge is free and open source.
 
-Use the connected-controller list to choose a controller to manage. MiSTer assigns players; connection slots are internal. Pair controllers one at a time. Pairing stops after one controller connects; start pairing again to add the next controller. Press BOOTSEL during normal operation to start pairing; press it again to stop pairing if no controller has connected. Holding the button triggers only one action. The LED flashes while pairing, including when other controllers are connected. Holding BOOTSEL while plugging in the adapter retains its normal USB bootloader behavior. Beta-59 retries Classic discovery when an inquiry restart is temporarily rejected and accepts saved BLE controllers whose reconnect advertisements omit the HID service UUID. Multi mode may increase input latency. Multi mode has a hard limit of two simultaneous controllers. Saved controllers and profiles are preserved. A third connection is refused, and pairing is unavailable while both connections are occupied.
+## Features
 
-Beta-58 fixes shared reconnect rotation, concurrent incoming Classic connection routing, pending disconnect cleanup, controller deletion state, and BLE bonded identity reuse. Pairing a remembered controller reuses its existing entry and profiles; identical controller names do not merge separate devices. Existing duplicate entries are not automatically merged.
+- Bluetooth Classic and Bluetooth Low Energy controller support
+- Support for many PlayStation, Xbox, Nintendo, 8BitDo and standard HID controllers
+- MiSTer, X-Input, Generic HID and Nintendo Switch USB output modes
+- Single-controller and two-controller modes
+- Remembered controllers with automatic reconnect
+- Multiple profiles per controller
+- Button remapping and duplication
+- Stick and trigger deadzones
+- Axis inversion
+- Turbo
+- Button-chord macros
+- Per-profile MiSTer controller identities
+- Optional shared MiSTer mappings between profiles
+- Rumble where supported
+- Controller blocking and management
+- Configuration export and import
+- Built-in diagnostics
+- Persistent settings stored directly on the adapter
 
-This source update has passed local behavior and syntax checks. A Pico SDK build and hardware verification have not been performed in this environment. No compiled UF2 is included. The separate BlueBridge site and Companion Desktop need subsequent updates for the mode controls and new USB PID `0x10B3`.
+BlueBridge does **not use Wi-Fi on the Pico**. Bluetooth is dedicated to controllers, while management is handled over USB or, when connected to MiSTer, through the Companion Remote daemon.
 
+## Requirements
 
-MC BlueBridge is a Raspberry Pi Pico 2 W Bluetooth controller bridge and customization platform designed primarily for MiSTer.
+MC BlueBridge requires:
 
-Bluetooth controllers connect to a Pico 2 W and are translated into a normalized BlueBridge controller state before profiles, mappings, and other behavior are applied. The normalized state is then emitted through the selected USB output driver. The supported output modes are MiSTer, X-Input, Generic HID, and Nintendo Switch.
+- **Raspberry Pi Pico 2 W**
+- USB data connection to the host
+- Supported Bluetooth controller
 
-## Architecture
+Other Raspberry Pi Pico models are not supported.
 
-- Raspberry Pi Pico 2 W only
-- BTstack for Bluetooth Classic and Bluetooth Low Energy transport
-- BlueBridge-native controller identification and input parsing
-- Generic HID descriptor parsing for standards-compliant Bluetooth gamepads
-- Dedicated controller protocol handling where generic HID is not sufficient
-- Bluetooth Classic HID support
-- Bluetooth Low Energy HID-over-GATT support
-- Nintendo custom BLE support for newer Nintendo controllers
-- One active Bluetooth controller at a time
-- Independent USB output drivers for MiSTer, X-Input, Generic HID, and Nintendo Switch
-- USB CDC management channel for Companion Remote and the BlueBridge configuration website
-- Persistent controller-based profile configuration
-- Remembered controllers matched by Bluetooth identity with native VID/PID metadata when available
-- Multiple profiles per controller with button remapping, duplication, deadzones, axis inversion, turbo, and macros
-- Persistent Bluetooth device blacklist with visible Bluetooth IDs and explicit block/unblock management
-- Separate MiSTer controller mapping per profile by default
-- Optional shared MiSTer mapping between profiles of the same controller
-- Configuration export/import through the CDC protocol
-- Onboard LED status indication
-- No Wi-Fi, DHCP, DNS, or Pico-hosted web interface
+Pre-built adapters and DIY installations use the same BlueBridge firmware.
+
+## Managing BlueBridge
+
+There are three main ways to configure BlueBridge.
+
+### MiSTer Companion Desktop
+
+**MiSTer Companion Desktop** provides the most complete BlueBridge management experience.
+
+It can manage an adapter:
+
+- Directly over USB
+- Remotely through a MiSTer running Companion Remote
+- Without requiring the adapter to be connected to a MiSTer
+
+MiSTer Companion can manage controllers, profiles, mappings and adapter settings, view diagnostics, and **install or update BlueBridge firmware**.
+
+### Companion Remote
+
+**Companion Remote** is a daemon that runs on the MiSTer itself.
+
+When BlueBridge is connected to the MiSTer, Companion Remote communicates with the adapter over USB and exposes BlueBridge over the network.
+
+You can manage BlueBridge through Companion Remote in two ways:
+
+- From **MiSTer Companion Desktop**
+- Directly from a web browser on a phone, tablet or computer
+
+Open:
+
+**http://MISTERIP:9191**
+
+Replace `MISTERIP` with the IP address of your MiSTer.
+
+This allows BlueBridge to remain connected to the MiSTer while you configure it remotely from another device.
+
+### BlueBridge website
+
+BlueBridge can also be configured directly over USB using:
+
+**https://bluebridge.mistercompanion.org**
+
+The website communicates directly with the adapter through the browser and can be used without MiSTer Companion or Companion Remote.
+
+It can manage controllers, profiles and adapter settings, but it **does not install or update BlueBridge firmware**.
+
+Firmware updates should be performed using MiSTer Companion or by manually flashing a UF2 file.
+
+## Pairing controllers
+
+Connect BlueBridge to a supported USB host and start pairing from MiSTer Companion, Companion Remote or the BlueBridge website.
+
+Put your controller into Bluetooth pairing mode and select **Start Pairing**.
+
+Once paired, the controller is remembered and normally reconnects automatically when it is turned on again.
+
+### Pairing with the BOOTSEL button
+
+You can also start pairing directly from the adapter.
+
+During normal operation:
+
+1. Hold **BOOTSEL for about one second**.
+2. Release it when the onboard LED starts blinking rapidly.
+3. Put your controller into Bluetooth pairing mode.
+4. BlueBridge stops pairing automatically after a controller connects.
+
+This is especially useful when the adapter is connected to a Nintendo Switch or Switch 2.
+
+Holding BOOTSEL while plugging the Pico into USB still enters the normal Raspberry Pi bootloader.
 
 ## Controller support
 
-BlueBridge uses its own controller layer instead of relying on a third-party controller abstraction library. Standard HID controllers use the generic HID path where possible, while controllers with proprietary initialization or report formats use dedicated BlueBridge handling.
+BlueBridge contains its own controller identification and input system.
 
-The controller layer is designed to cover major Bluetooth controller families including Sony, Nintendo, Microsoft/Xbox, 8BitDo, Steam, Stadia, SteelSeries, OUYA, Atari, iCade, Android-style gamepads, and other standards-compliant HID controllers.
+Standard Bluetooth HID controllers use the generic HID implementation where possible, while controllers requiring special initialization, report formats or Bluetooth behavior use dedicated support.
 
-Nintendo support includes the Switch Pro Controller, Joy-Con controllers, the Nintendo Switch Online retro-controller family, the Nintendo Switch 2 Pro Controller, and the Nintendo GameCube Controller for Nintendo Switch Online. Older Switch-era controllers and newer Nintendo BLE controllers are handled as separate protocol families.
+Supported controller families include devices from:
 
-Compatibility remains hardware-dependent, and individual models, firmware revisions, and operating modes may require controller-specific adjustments.
+- Sony / PlayStation
+- Microsoft / Xbox
+- Nintendo
+- 8BitDo
+- Valve / Steam
+- Google Stadia
+- SteelSeries
+- Atari
+- OUYA
+- iCade
+- Android-style HID controllers
+- Other standards-compliant Bluetooth gamepads
 
-## Controller profiles
+Nintendo support includes Switch controllers, Joy-Con, Nintendo Switch Online retro controllers, newer Nintendo BLE controllers and the Switch 2 Pro Controller.
 
-Each remembered controller has its own set of profiles. New profiles use a separate MiSTer controller identity by default so mappings configured on MiSTer can remain profile-specific.
+Compatibility can vary between controller models, firmware revisions and controller operating modes.
 
-Profiles can optionally share the same MiSTer mapping when the user wants multiple BlueBridge profiles to use one MiSTer controller configuration. Profiles can also be duplicated and tuned independently with stick and trigger deadzones, axis inversion, turbo, and button-chord macros.
+## Profiles
 
-The controller's native VID/PID and Bluetooth identity are used internally by BlueBridge for identification and compatibility handling. BlueBridge presents its own USB identity to MiSTer.
+Every remembered controller can have multiple profiles.
 
-## LED states
+A profile can contain its own:
 
-- Solid: controller connected
-- Slow blink: waiting for a controller
-- Fast blink: explicit pairing mode
-- Double blink: profile changed
-- Rapid blink: error or recovery state
+- Button mapping
+- Stick deadzones
+- Trigger deadzones
+- Axis inversion
+- Turbo configuration
+- Macros
+- MiSTer controller identity
 
-## MiSTer default mapping
+Profiles can be duplicated and adjusted independently.
 
-MC BlueBridge normalizes supported controllers into one positional layout before profiles are applied: South, East, West, North, L1, R1, L2, R2, Select, Start, L3, R3 and Home. This keeps the default MiSTer behavior consistent across PlayStation, Xbox, Nintendo and other controller families while still allowing every profile to override the mapping.
+By default, separate profiles receive separate MiSTer USB identities. This allows MiSTer to keep a different controller mapping for each profile.
 
-BlueBridge does not automatically create or overwrite MiSTer controller mappings. Each separate profile identity remains user-configurable inside MiSTer, including menu navigation, confirm/back behavior, and core-specific mappings. Profiles that share a MiSTer identity reuse the same MiSTer-side mapping.
+Profiles can instead share one MiSTer identity when you want multiple BlueBridge profiles to use the same MiSTer-side mapping.
 
-## Build
+## USB output modes
 
-Initialize the Pico SDK and its submodules, then build for Pico 2 W:
+BlueBridge supports four USB output modes.
+
+### MiSTer
+
+The default and recommended mode for MiSTer.
+
+It supports BlueBridge's full profile system and separate MiSTer controller identities for different profiles.
+
+### X-Input
+
+Presents BlueBridge as an Xbox-style X-Input controller.
+
+Useful for Windows and other software designed around Xbox controllers.
+
+Analog triggers and rumble are supported where available.
+
+### Generic HID
+
+Presents BlueBridge as a standard USB HID gamepad.
+
+Useful for hosts and applications that work best with a conventional USB controller.
+
+### Nintendo Switch
+
+Presents BlueBridge as a compatible wired controller for Nintendo Switch and Nintendo Switch 2.
+
+The required wired controller / USB controller option must be enabled on the console.
+
+Changing USB output mode is persistent and automatically re-enumerates BlueBridge with the appropriate USB identity.
+
+## Nintendo Switch and Switch 2
+
+BlueBridge works as a wired USB controller on both Nintendo Switch and Nintendo Switch 2.
+
+However, **the BlueBridge management interface cannot be accessed while the adapter is connected directly to a Switch or Switch 2**.
+
+When using BlueBridge on a Switch, you therefore need to either:
+
+- Use a controller that is already paired with the adapter
+- Start pairing manually using the BOOTSEL button
+
+For configuration, profile changes or other management, connect the adapter to a computer or MiSTer and use MiSTer Companion, Companion Remote or the BlueBridge website.
+
+## Multi-controller mode
+
+BlueBridge can expose **two simultaneous controllers** through a single adapter.
+
+Each connected controller keeps its own:
+
+- Active profile
+- Button mapping
+- Analog settings
+- Supported rumble behavior
+
+MiSTer decides which controller belongs to each player. BlueBridge's internal connection slots are not player numbers.
+
+Pair controllers one at a time. After one finishes pairing, start pairing again to add another.
+
+Multi-controller mode has a hard limit of **two connected controllers**. A third connection is refused while both slots are occupied.
+
+Because two Bluetooth controllers share one adapter, multi-controller mode may have slightly higher latency than single-controller mode.
+
+Turbo and macros are available in single-controller mode. Their saved settings are preserved when switching between modes.
+
+## MiSTer controller mapping
+
+BlueBridge normalizes supported controllers into a common positional layout before profile settings are applied:
+
+**South, East, West, North, L1, R1, L2, R2, Select, Start, L3, R3 and Home**
+
+This gives controllers from different manufacturers a predictable starting point.
+
+BlueBridge does not automatically create or overwrite MiSTer's controller mappings.
+
+Menu navigation, confirm/back behavior and core-specific mappings remain configurable inside MiSTer.
+
+Profiles using separate MiSTer identities can have separate MiSTer mappings, while profiles sharing an identity reuse the same mapping.
+
+## LED status
+
+The onboard Pico LED shows the current BlueBridge state:
+
+- **Solid** — controller connected
+- **Slow blink** — waiting for a remembered controller
+- **Fast blink** — pairing mode
+- **Double blink** — profile changed
+- **Rapid blink** — error or recovery state
+
+## Managing controllers
+
+BlueBridge keeps remembered controllers and their profiles stored directly on the adapter.
+
+From the management interface you can:
+
+- View connected and remembered controllers
+- Rename controllers
+- Select the active profile
+- Create, duplicate and remove profiles
+- Change button mappings
+- Configure analog settings
+- Configure turbo and macros
+- Disconnect a controller
+- Remove a remembered controller
+- Block or unblock Bluetooth devices
+- Export and import configuration
+- View diagnostics
+
+Controller identity is tracked using Bluetooth information and native controller metadata where available, so two controllers with the same displayed name can remain separate devices.
+
+## Firmware updates
+
+BlueBridge firmware can be installed and updated through **MiSTer Companion Desktop**.
+
+Firmware can also be flashed manually by placing the Pico 2 W into BOOTSEL mode and copying the BlueBridge UF2 file to it.
+
+The direct USB BlueBridge website does **not** install or update firmware.
+
+## Diagnostics
+
+BlueBridge includes diagnostics intended to make controller compatibility and Bluetooth problems easier to troubleshoot.
+
+Diagnostic information can be viewed or exported from supported BlueBridge management interfaces and can be useful when reporting:
+
+- Pairing problems
+- Reconnection problems
+- Incorrect mappings
+- Analog input problems
+- Rumble issues
+- Controller identification issues
+- Bluetooth transport problems
+
+## Building from source
+
+MC BlueBridge uses the Raspberry Pi Pico SDK and its bundled BTstack version.
 
 ```bash
 export PICO_SDK_PATH="$HOME/pico/pico-sdk"
+
 cd "$PICO_SDK_PATH"
 git submodule update --init lib/btstack
+
 cd /path/to/MC-BlueBridge
-rm -rf build && mkdir build && cd build
+rm -rf build
+mkdir build
+cd build
+
 cmake -G Ninja -DPICO_BOARD=pico2_w ..
 ninja
 ```
 
-A separate BTstack checkout can be supplied with `BTSTACK_ROOT` when needed. The Pico SDK-pinned BTstack version is recommended.
+A separate BTstack checkout can be supplied through `BTSTACK_ROOT` when needed, although the Pico SDK-pinned version is recommended.
 
-## USB output modes
+## Limitations
 
-MC BlueBridge exposes four output modes:
+Controller support depends on the hardware, controller firmware and Bluetooth mode being used.
 
-- MiSTer: BlueBridge's native MiSTer-focused HID identity with per-profile MiSTer identity support
-- X-Input: Xbox 360-style USB controller output with analog triggers and rumble feedback
-- Generic HID: standards-based USB HID gamepad output
-- Nintendo Switch: wired USB HID controller output for Nintendo Switch and Nintendo Switch 2
+Some controller-specific features may not currently be available, including:
 
-Output selection is persistent and changing modes re-enumerates the USB device with the appropriate identity and protocol. Controller input is normalized before output translation, so controller-specific report layouts do not leak into the USB output drivers. Analog input triggers are preserved for outputs that support them and converted by the output driver when the target protocol uses digital trigger semantics.
+- Motion sensors
+- Touchpads
+- Adaptive triggers
+- Controller-specific lighting
 
-Each output mode includes a CDC management interface alongside its controller interface. Availability on the host depends on USB driver binding.
+Rumble availability also depends on both the connected controller and the selected USB output mode.
 
-## Development and compatibility
-
-Controller compatibility and output behavior are validated through hardware testing. Support can vary by controller model, firmware revision, operating mode, and host platform.
-
-Motion sensors, touchpads, adaptive triggers, and controller-specific lighting are areas for further development.
+Multi-controller mode is limited to two simultaneous controllers and may have slightly higher latency than single-controller mode.
 
 ## Acknowledgments
 
-[JoypadOS](https://github.com/joypad-ai/joypad-os) was consulted as a reference when I encountered controller compatibility and Bluetooth and USB protocol issues that the project had already solved. MC BlueBridge has its own implementation; JoypadOS helped me understand the expected behavior and troubleshoot these issues.
+[JoypadOS](https://github.com/joypad-ai/joypad-os) was consulted as a behavioral reference while troubleshooting controller compatibility, Bluetooth initialization, controller report formats and USB output behavior.
+
+No JoypadOS source code is used in MC BlueBridge.
+
+MC BlueBridge has its own controller handling, input pipeline, profile storage, management protocol and USB output implementation. JoypadOS was useful as a reference for understanding expected controller and protocol behavior when investigating compatibility issues.
 
 Thank you to the JoypadOS contributors for making their work publicly available.
 
-## License and third-party components
+## License
 
-MC BlueBridge project code is licensed under the GNU General Public License v3.0 (GPL-3.0).
+MC BlueBridge project code is licensed under the **GNU General Public License v3.0 (GPL-3.0)**.
 
-MC BlueBridge also uses third-party components that remain subject to their own licenses:
+MC BlueBridge also uses third-party components including:
 
-- BTstack is used as the Bluetooth transport. Raspberry Pi provides supplemental BTstack licensing for use with supported Raspberry Pi Pico wireless hardware, including Pico 2 W. The applicable upstream and Raspberry Pi license terms must be preserved when redistributing builds that include BTstack.
-- Raspberry Pi Pico SDK components remain subject to their respective upstream licenses.
-- TinyUSB and any other bundled or linked third-party components remain subject to their respective upstream licenses.
+- Raspberry Pi Pico SDK
+- BTstack
+- TinyUSB
 
-The GPL-3.0 license applies to MC BlueBridge's own project code and does not replace or remove the license terms of third-party components. When redistributing MC BlueBridge source or binaries, retain the license notices required by those dependencies.
+These components remain subject to their own upstream license terms.
+
+The GPL-3.0 license applies to MC BlueBridge's own project code and does not replace or override the licenses of third-party components.
