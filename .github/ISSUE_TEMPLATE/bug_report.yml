@@ -1,0 +1,188 @@
+name: Bug report
+description: Report a problem with MC BlueBridge, controller behavior, pairing, reconnects, mappings, rumble, or management.
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem with MC BlueBridge.
+
+        Please provide as much detail as possible. If available, attach a BlueBridge Diagnostics JSON file from MiSTer Companion, Companion Remote, or the BlueBridge website. Diagnostics are especially useful for controller, Bluetooth, mapping, reconnect, and rumble issues.
+
+  - type: input
+    id: firmware
+    attributes:
+      label: BlueBridge firmware version
+      description: Enter the firmware version currently installed on the adapter.
+      placeholder: "Example: v1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: management
+    attributes:
+      label: Management method
+      description: How were you managing BlueBridge when the issue occurred?
+      options:
+        - MiSTer Companion Desktop over USB
+        - MiSTer Companion Desktop through Companion Remote
+        - Companion Remote web interface
+        - BlueBridge USB website
+        - BOOTSEL button / no management interface
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Host device
+      options:
+        - MiSTer
+        - Windows PC
+        - Linux PC
+        - macOS
+        - Nintendo Switch
+        - Nintendo Switch 2
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: output_mode
+    attributes:
+      label: USB output mode
+      options:
+        - MiSTer
+        - X-Input
+        - Generic HID
+        - Nintendo Switch
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: controller
+    attributes:
+      label: Controller make and model
+      placeholder: "Example: Sony DualSense, 8BitDo Pro 2, Xbox Series Controller"
+    validations:
+      required: true
+
+  - type: input
+    id: controller_mode
+    attributes:
+      label: Controller operating mode
+      description: If your controller has multiple Bluetooth modes, enter the mode used.
+      placeholder: "Example: D-Input, X-Input, Switch mode, BLE, unknown"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: controller_count_mode
+    attributes:
+      label: BlueBridge controller mode
+      options:
+        - Single-controller mode
+        - Multi-controller mode
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: Describe the issue
+      description: Explain what is going wrong.
+      placeholder: "Describe the problem in as much detail as possible."
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Tell us exactly how to reproduce the problem.
+      placeholder: |
+        1. Connect...
+        2. Pair...
+        3. Press...
+        4. The issue occurs...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: "What did you expect to happen?"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: "What happened instead?"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: How often does it happen?
+      options:
+        - Every time
+        - Most of the time
+        - Sometimes
+        - Only happened once
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: earlier_version
+    attributes:
+      label: Did this work in an earlier firmware version?
+      options:
+        - "Yes"
+        - "No"
+        - Not sure
+    validations:
+      required: true
+
+  - type: input
+    id: last_working
+    attributes:
+      label: Last known working version
+      description: If known, enter the last firmware version where this worked correctly.
+      placeholder: "Example: v0.9.9"
+    validations:
+      required: false
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics, logs, screenshots, or videos
+      description: Drag and drop your BlueBridge Diagnostics JSON file, logs, screenshots, or a short video here.
+      placeholder: "Attach files here if available."
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional information
+      description: Add anything else that may help reproduce or understand the issue.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Existing issues
+      options:
+        - label: I have searched both open and closed issues and did not find an existing report that matches this issue.
+          required: true

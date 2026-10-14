@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: BlueBridge USB configuration
+    url: https://bluebridge.mistercompanion.org
+    about: Configure a BlueBridge adapter directly over USB from a supported web browser.
+  - name: MiSTer Companion
+    url: https://github.com/Anime0t4ku/mister-companion
+    about: Report issues that are specifically about the MiSTer Companion application rather than BlueBridge firmware.

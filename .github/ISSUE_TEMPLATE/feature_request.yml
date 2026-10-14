@@ -1,0 +1,86 @@
+name: Feature request
+description: Suggest an improvement, new controller feature, output option, or management feature for MC BlueBridge.
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement to MC BlueBridge.
+
+        Please describe the problem or use case first, then explain the feature you would like to see.
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feature area
+      options:
+        - Controller support
+        - Controller profiles
+        - Button mapping
+        - Turbo or macros
+        - Rumble
+        - Bluetooth behavior
+        - Multi-controller mode
+        - MiSTer output
+        - X-Input output
+        - Generic HID output
+        - Nintendo Switch output
+        - MiSTer Companion
+        - Companion Remote
+        - BlueBridge website
+        - Diagnostics
+        - Firmware update process
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to do, or what limitation are you running into?
+      placeholder: "Describe the problem this feature would solve."
+    validations:
+      required: true
+
+  - type: textarea
+    id: request
+    attributes:
+      label: Requested feature
+      description: Describe the behavior or feature you would like BlueBridge to add.
+    validations:
+      required: true
+
+  - type: textarea
+    id: benefit
+    attributes:
+      label: Why would this be useful?
+      description: Explain who would benefit and how.
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: If you currently use a workaround, describe it here.
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional information
+      description: Add examples, screenshots, links, controller models, or other useful context.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Existing requests
+      options:
+        - label: I have searched existing issues and did not find an existing request for the same feature.
+          required: true

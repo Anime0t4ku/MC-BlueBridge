@@ -1,0 +1,226 @@
+name: Controller compatibility report
+description: Report compatibility results for a specific Bluetooth controller.
+title: "[Controller] "
+labels:
+  - controller compatibility
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form to report how a specific controller works with MC BlueBridge.
+
+        Please attach a BlueBridge Diagnostics JSON file if possible. It can provide controller identity, Bluetooth, input, and capability information that is difficult to determine from the controller name alone.
+
+  - type: input
+    id: firmware
+    attributes:
+      label: BlueBridge firmware version
+      placeholder: "Example: v1.0.0"
+    validations:
+      required: true
+
+  - type: input
+    id: manufacturer
+    attributes:
+      label: Manufacturer
+      placeholder: "Example: Sony, 8BitDo, Microsoft, Nintendo"
+    validations:
+      required: true
+
+  - type: input
+    id: controller
+    attributes:
+      label: Controller model
+      placeholder: "Example: DualSense, Pro 2, Ultimate 2C"
+    validations:
+      required: true
+
+  - type: input
+    id: controller_mode
+    attributes:
+      label: Controller operating mode
+      description: Enter the Bluetooth mode used if the controller supports more than one.
+      placeholder: "Example: D-Input, X-Input, Switch mode, BLE, unknown"
+    validations:
+      required: false
+
+  - type: dropdown
+    id: bluetooth_type
+    attributes:
+      label: Bluetooth connection type
+      options:
+        - Bluetooth Classic
+        - Bluetooth Low Energy
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: output_mode
+    attributes:
+      label: USB output mode tested
+      options:
+        - MiSTer
+        - X-Input
+        - Generic HID
+        - Nintendo Switch
+        - Multiple output modes
+    validations:
+      required: true
+
+  - type: dropdown
+    id: bluebridge_mode
+    attributes:
+      label: BlueBridge controller mode tested
+      options:
+        - Single-controller mode
+        - Multi-controller mode
+        - Both
+        - Not sure
+    validations:
+      required: true
+
+  - type: dropdown
+    id: pairing
+    attributes:
+      label: Pairing
+      options:
+        - Works correctly
+        - Works with issues
+        - Does not work
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: reconnect
+    attributes:
+      label: Automatic reconnect
+      options:
+        - Works correctly
+        - Works with issues
+        - Does not work
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: buttons
+    attributes:
+      label: Buttons
+      options:
+        - Correct
+        - Some buttons are wrong or missing
+        - Mostly unusable
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dpad
+    attributes:
+      label: D-pad
+      options:
+        - Correct
+        - Incorrect
+        - Not working
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: sticks
+    attributes:
+      label: Analog sticks
+      options:
+        - Correct
+        - Incorrect or drifting
+        - Not working
+        - Controller has no analog sticks
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: triggers
+    attributes:
+      label: Triggers
+      options:
+        - Correct
+        - Incorrect
+        - Not working
+        - Controller has no triggers
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: special_buttons
+    attributes:
+      label: Home, Capture, paddles, or other extra buttons
+      options:
+        - Correct
+        - Partially working
+        - Not working
+        - Controller has none
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: rumble
+    attributes:
+      label: Rumble
+      options:
+        - Works correctly
+        - Works with issues
+        - Not working
+        - Controller does not support rumble
+        - Not tested
+    validations:
+      required: true
+
+  - type: dropdown
+    id: battery
+    attributes:
+      label: Battery reporting
+      options:
+        - Works correctly
+        - Incorrect
+        - Not available
+        - Controller has no battery
+        - Not tested
+    validations:
+      required: true
+
+  - type: textarea
+    id: mapping_notes
+    attributes:
+      label: Mapping or behavior details
+      description: Describe any incorrect button mappings, trigger values, stick behavior, reconnect problems, or other compatibility details.
+    validations:
+      required: false
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: Drag and drop a BlueBridge Diagnostics JSON file here if available.
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional notes
+      description: Include controller firmware version, unusual behavior, or anything else that may help.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Existing reports
+      options:
+        - label: I have searched existing issues for this controller and operating mode.
+          required: true
