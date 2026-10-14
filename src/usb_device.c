@@ -1,6 +1,7 @@
 #include "usb_device.h"
 #include "usb_descriptors.h"
 #include "xinput_device.h"
+#include "xbox360_auth.h"
 #include "hid_feedback.h"
 #include "cdc_protocol.h"
 #include "bt_host.h"
@@ -182,7 +183,7 @@ static bool send_switch_state(const bb_gamepad_report_t* r) {
 
 static void send_pending(void) {
     bb_output_mode_t mode = bb_output_mode();
-    if (mode == BB_OUTPUT_XINPUT ? !bb_xinput_ready() : !tud_hid_n_ready(usb_slot)) return;
+    if ((mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_XBOX360) ? !bb_xinput_ready() : !tud_hid_n_ready(usb_slot)) return;
     bb_gamepad_report_t report;
     uint16_t latched_for_send = 0;
     bool send = false;
@@ -195,6 +196,9 @@ static void send_pending(void) {
         --q->count;
         send = true;
         queued = true;
+    } else if (mode == BB_OUTPUT_XBOX360) {
+        report = latest_slots[usb_slot];
+        send = true;
     } else if (mode == BB_OUTPUT_SWITCH && (uint32_t)(to_ms_since_boot(get_absolute_time()) - switch_last_send) >= 15u) {
         report = latest_slots[usb_slot];
         send = true;
@@ -207,7 +211,7 @@ static void send_pending(void) {
     critical_section_exit(&usb_lock);
     if (!send) return;
     bool ok = false;
-    if (mode == BB_OUTPUT_XINPUT) ok = send_xinput(&report);
+    if (mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_XBOX360) ok = send_xinput(&report);
     else if (mode == BB_OUTPUT_SWITCH) {
         ok = send_switch_state(&report);
         if (ok) switch_last_send = to_ms_since_boot(get_absolute_time());
@@ -269,6 +273,7 @@ static void handle_reenumeration(void) {
     tud_disconnect();
     sleep_ms(120);
     switch_last_send = 0;
+    if (bb_output_mode() == BB_OUTPUT_XBOX360) bb_xbox360_auth_init();
     tud_connect();
 }
 
@@ -276,6 +281,7 @@ void bb_usb_core1(void) {
     flash_safe_execute_core_init();
     critical_section_init(&usb_lock);
     usb_lock_ready = true;
+    if (bb_output_mode() == BB_OUTPUT_XBOX360) bb_xbox360_auth_init();
     tusb_init();
     while (true) {
         if (bb_output_mode() == BB_OUTPUT_MISTER) {
@@ -285,6 +291,7 @@ void bb_usb_core1(void) {
             }
         }
         tud_task();
+        if (bb_output_mode() == BB_OUTPUT_XBOX360) bb_xbox360_auth_task();
         bb_usb_service_pending();
         bb_cdc_poll();
         handle_reenumeration();
@@ -347,6 +354,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_
 }
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const* request) {
+    if (bb_output_mode() == BB_OUTPUT_XBOX360 && bb_xbox360_auth_control(rhport, stage, request)) return true;
     static const uint8_t compatible_id[40] = {
         40,0,0,0,0,1,4,0,1,0,0,0,0,0,0,0,
         0,1,'X','U','S','B','1','0',0,0,0,0,0,0,0,0,

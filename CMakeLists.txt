@@ -16,6 +16,25 @@ endif()
 
 include(pico_sdk_import.cmake)
 project(mc_bluebridge C CXX ASM)
+
+if(DEFINED ENV{LIBXSM3_ROOT})
+  set(LIBXSM3_SOURCE_DIR $ENV{LIBXSM3_ROOT})
+elseif(EXISTS "${CMAKE_CURRENT_LIST_DIR}/deps/libxsm3/xsm3.h")
+  set(LIBXSM3_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/deps/libxsm3")
+else()
+  include(FetchContent)
+  FetchContent_Declare(
+    libxsm3
+    GIT_REPOSITORY https://github.com/InvoxiPlayGames/libxsm3.git
+    GIT_TAG master
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_GetProperties(libxsm3)
+  if(NOT libxsm3_POPULATED)
+    FetchContent_Populate(libxsm3)
+  endif()
+  set(LIBXSM3_SOURCE_DIR ${libxsm3_SOURCE_DIR})
+endif()
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 
@@ -30,6 +49,12 @@ add_executable(mc_bluebridge
   src/controller_driver.c
   src/hid_feedback.c
   src/xinput_device.c
+  src/xbox360_auth.c
+  ${LIBXSM3_SOURCE_DIR}/xsm3.c
+  ${LIBXSM3_SOURCE_DIR}/usbdsec.c
+  ${LIBXSM3_SOURCE_DIR}/excrypt_des.c
+  ${LIBXSM3_SOURCE_DIR}/excrypt_parve.c
+  src/xsm3_excrypt_sha.c
   src/usb_device.c
   src/usb_descriptors.c
   src/cdc_protocol.c
@@ -40,7 +65,10 @@ add_executable(mc_bluebridge
 
 target_include_directories(mc_bluebridge PRIVATE
   src
+  ${LIBXSM3_SOURCE_DIR}
 )
+
+target_compile_definitions(mc_bluebridge PRIVATE XSM3_NO_DEBUGGING=1)
 
 target_link_libraries(mc_bluebridge PUBLIC
   pico_stdlib

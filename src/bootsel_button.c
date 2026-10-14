@@ -1,6 +1,7 @@
 #include "bootsel_button.h"
 #include "bluebridge_platform.h"
 #include "bluebridge_state.h"
+#include "usb_device.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
@@ -10,8 +11,10 @@
 static bool initialized;
 static bool observed;
 static bool stable;
-static bool armed;
 static uint32_t changed_at;
+static uint32_t pressed_at;
+static bool pairing_action;
+static bool recovery_action;
 
 static void __no_inline_not_in_flash_func(sample_bootsel)(void* context) {
     uint32_t saved = ioqspi_hw->io[1].ctrl;
@@ -30,8 +33,8 @@ void bb_bootsel_poll(uint32_t now) {
         initialized = true;
         observed = pressed;
         stable = pressed;
-        armed = !pressed;
         changed_at = now;
+        pressed_at = pressed ? now : 0;
         return;
     }
     if (pressed != observed) {
@@ -39,16 +42,27 @@ void bb_bootsel_poll(uint32_t now) {
         changed_at = now;
         return;
     }
-    if (pressed == stable || (uint32_t)(now - changed_at) < 30u) return;
-    stable = pressed;
-    if (!pressed) {
-        armed = true;
+    if (pressed != stable && (uint32_t)(now - changed_at) >= 30u) {
+        stable = pressed;
+        if (stable) {
+            pressed_at = now;
+            pairing_action = false;
+            recovery_action = false;
+        }
         return;
     }
-    if (!armed) return;
-    armed = false;
-    bb_runtime_state_t state;
-    bb_state_get(&state);
-    if (state.pairing) bb_platform_stop_pairing();
-    else bb_platform_start_pairing();
+    if (!stable) return;
+    uint32_t held = (uint32_t)(now - pressed_at);
+    if (!pairing_action && held >= 1000u) {
+        pairing_action = true;
+        bb_runtime_state_t state;
+        bb_state_get(&state);
+        if (state.pairing) bb_platform_stop_pairing();
+        else bb_platform_start_pairing();
+    }
+    if (!recovery_action && held >= 5000u && bb_output_mode() == BB_OUTPUT_XBOX360) {
+        recovery_action = true;
+        bb_platform_stop_pairing();
+        if (bb_output_mode_set(BB_OUTPUT_MISTER)) bb_usb_request_reenumeration();
+    }
 }

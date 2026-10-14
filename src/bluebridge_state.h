@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define BLUEBRIDGE_VERSION "1.0.0-RC-3"
+#define BLUEBRIDGE_VERSION "1.0.0-RC-4"
 #define BLUEBRIDGE_FIRMWARE_MANIFEST "MCBLUEBRIDGE|" BLUEBRIDGE_VERSION "|PICO2W|SCHEMA=13"
 #define BLUEBRIDGE_PROTOCOL_VERSION 2
 #define BB_CONFIG_SCHEMA 13
@@ -30,7 +30,8 @@ typedef enum {
     BB_OUTPUT_MISTER = 1,
     BB_OUTPUT_XINPUT = 2,
     BB_OUTPUT_GENERIC_HID = 3,
-    BB_OUTPUT_SWITCH = 4
+    BB_OUTPUT_SWITCH = 4,
+    BB_OUTPUT_XBOX360 = 5
 } bb_output_mode_t;
 
 typedef struct __attribute__((packed)) {

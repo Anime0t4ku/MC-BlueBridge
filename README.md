@@ -10,7 +10,7 @@ MC BlueBridge is free and open source.
 
 - Bluetooth Classic and Bluetooth Low Energy controller support
 - Support for many PlayStation, Xbox, Nintendo, 8BitDo and standard HID controllers
-- MiSTer, X-Input, Generic HID and Nintendo Switch USB output modes
+- MiSTer, X-Input, Generic HID, Nintendo Switch and Xbox 360 console USB output modes
 - Single-controller and two-controller modes
 - Remembered controllers with automatic reconnect
 - Multiple profiles per controller
@@ -158,7 +158,7 @@ Profiles can instead share one MiSTer identity when you want multiple BlueBridge
 
 ## USB output modes
 
-BlueBridge supports four USB output modes.
+BlueBridge supports five USB output modes.
 
 ### MiSTer
 
@@ -185,6 +185,12 @@ Useful for hosts and applications that work best with a conventional USB control
 Presents BlueBridge as a compatible wired controller for Nintendo Switch and Nintendo Switch 2.
 
 The required wired controller / USB controller option must be enabled on the console.
+
+### Xbox 360 (Console)
+
+Presents BlueBridge as a wired Xbox 360 controller and uses XSM3 authentication for retail Xbox 360 consoles. This mode is separate from the normal X-Input mode used for PC compatibility.
+
+The native Xbox 360 USB layout does not expose the BlueBridge management interface. Configure and pair the adapter before switching to this mode. To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
 
 Changing USB output mode is persistent and automatically re-enumerates BlueBridge with the appropriate USB identity.
 
@@ -325,6 +331,8 @@ Rumble availability also depends on both the connected controller and the select
 
 Multi-controller mode is limited to two simultaneous controllers and may have slightly higher latency than single-controller mode.
 
+Xbox 360 (Console) output is available in single-controller mode only. The management interface is unavailable while the native Xbox 360 USB mode is active.
+
 ## Acknowledgments
 
 [JoypadOS](https://github.com/joypad-ai/joypad-os) was consulted as a behavioral reference while troubleshooting controller compatibility, Bluetooth initialization, controller report formats and USB output behavior.
@@ -344,7 +352,9 @@ MC BlueBridge also uses third-party components including:
 - Raspberry Pi Pico SDK
 - BTstack
 - TinyUSB
+- libxsm3 (LGPL-2.1-or-later) for Xbox 360 XSM3 authentication
+- ExCrypt components included by libxsm3 (BSD-3-Clause)
 
-These components remain subject to their own upstream license terms.
+These components remain subject to their own upstream license terms. See `THIRD_PARTY_LICENSES.md` for the Xbox 360 authentication dependency information.
 
 The GPL-3.0 license applies to MC BlueBridge's own project code and does not replace or override the licenses of third-party components.

@@ -1018,8 +1018,12 @@ static bool accept_ble_advertisement(const uint8_t addr[6], bd_addr_type_t type,
     return !pairing && type == BD_ADDR_TYPE_LE_RANDOM && (addr[0] & 0xc0u) == 0x40u;
 }
 
+static bool controller_transport_ready(void) {
+    return bb_usb_ready() || bb_output_mode() == BB_OUTPUT_XBOX360;
+}
+
 static bool accept_candidate(const uint8_t addr[6], const char* name, bool protocol_hint) {
-    if (!bb_usb_ready()) return false;
+    if (!controller_transport_ready()) return false;
     if (bb_blocked_device_contains(addr)) return false;
     if (reconnect_blocked(addr)) return false;
     if (bb_multi_mode() && slot_for_address(addr) >= 0) return false;
@@ -1675,7 +1679,7 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
         sm_event_identity_resolving_failed_get_address(packet, address);
         if (same_address(address, ble_address_lookup_addr)) {
             ble_address_lookup_pending = false;
-            if (packet[0] == SM_EVENT_IDENTITY_RESOLVING_SUCCEEDED && size >= 20 && !connection_in_progress() && bb_usb_ready()) {
+            if (packet[0] == SM_EVENT_IDENTITY_RESOLVING_SUCCEEDED && size >= 20 && !connection_in_progress() && controller_transport_ready()) {
                 bd_addr_t identity;
                 sm_event_identity_resolving_succeeded_get_identity_address(packet, identity);
                 int slot = free_slot();
@@ -1829,7 +1833,7 @@ static void classic_hid_event(uint8_t* packet) {
             hid_subevent_connection_opened_get_bd_addr(packet, connected_addr);
             memcpy(pending_addr, connected_addr, 6);
 
-            if (!bb_usb_ready() || (!pairing && !remembered_address(connected_addr))) {
+            if (!controller_transport_ready() || (!pairing && !remembered_address(connected_addr))) {
                 hid_host_disconnect(classic_hid_cid);
                 break;
             }
@@ -2319,7 +2323,7 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
         if (slot >= 0) bb_slot_enter((uint8_t)slot);
         forget_device_impl(address);
     }
-    bool ready = bb_usb_ready();
+    bool ready = controller_transport_ready();
     uint32_t now = btstack_run_loop_get_time_ms();
     if (ble_address_lookup_pending && (uint32_t)(now - ble_address_lookup_at) >= 3000u) ble_address_lookup_pending = false;
     if (ready) { usb_was_ready = true; usb_lost_since = 0; }
@@ -2338,7 +2342,7 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
         bb_slot_enter(i);
         service_slot();
     }
-    if ((pairing || bb_multi_mode()) && !connection_in_progress() && free_slot() >= 0 && bb_usb_ready()) start_scans();
+    if ((pairing || bb_multi_mode()) && !connection_in_progress() && free_slot() >= 0 && controller_transport_ready()) start_scans();
     bb_slot_enter(previous);
     btstack_run_loop_set_timer(timer, 100);
     btstack_run_loop_add_timer(timer);
