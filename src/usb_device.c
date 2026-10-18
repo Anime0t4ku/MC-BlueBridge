@@ -215,6 +215,15 @@ static void send_pending(void) {
     else if (mode == BB_OUTPUT_SWITCH) {
         ok = send_switch_state(&report);
         if (ok) switch_last_send = to_ms_since_boot(get_absolute_time());
+    } else if (mode == BB_OUTPUT_GENERIC_HID && tud_hid_n_ready(usb_slot)) {
+        uint8_t gamepad[9] = {
+            (uint8_t)report.buttons, (uint8_t)(report.buttons >> 8),
+            report.hat >= 1 && report.hat <= 8 ? (uint8_t)(report.hat - 1) : 8,
+            (uint8_t)report.x, (uint8_t)report.y,
+            (uint8_t)report.rx, (uint8_t)report.ry,
+            report.lt, report.rt
+        };
+        ok = tud_hid_n_report(usb_slot, REPORT_ID_GAMEPAD, gamepad, sizeof(gamepad));
     } else if (tud_hid_n_ready(usb_slot)) {
         hid_gamepad_report_t gamepad = {0};
         gamepad.x = report.x;
