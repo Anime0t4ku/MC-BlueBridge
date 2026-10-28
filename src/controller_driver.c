@@ -1076,6 +1076,12 @@ static bool parse_8bitdo64_d(const uint8_t* report, uint16_t length) {
     return true;
 }
 
+static bool is_xbox_controller(void) {
+    return identity.kind == BB_CONTROLLER_XBOX_WIRELESS || identity.kind == BB_CONTROLLER_XBOX_ONE ||
+           identity.kind == BB_CONTROLLER_XBOX_SERIES || identity.kind == BB_CONTROLLER_XBOX_ELITE ||
+           identity.kind == BB_CONTROLLER_XBOX_ADAPTIVE;
+}
+
 static bool parse_generic(const uint8_t* report, uint16_t length) {
     if (!hid_descriptor || !hid_descriptor_len || !report || !length) return false;
     btstack_hid_parser_t parser;
@@ -1085,7 +1091,8 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
     bool arcade = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("arcade stick");
     bool m30 = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("m30");
     bool micro = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("micro");
-    if (arcade || m30 || micro) {
+    bool xbox = is_xbox_controller();
+    if (arcade || m30 || micro || xbox) {
         bool numbered = btstack_hid_report_id_declared(hid_descriptor, hid_descriptor_len);
         int expected = btstack_hid_get_report_size_for_id(numbered ? report[0] : HID_REPORT_ID_UNDEFINED, HID_REPORT_TYPE_INPUT, hid_descriptor, hid_descriptor_len);
         if (expected <= 0 || length < expected + numbered) return false;
@@ -1100,6 +1107,8 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
     int32_t axis_maximum[6] = {0};
     bool analog_lt = false;
     bool analog_rt = false;
+    bool xbox_sim_triggers = false;
+    uint32_t xbox_consumer_buttons = 0, xbox_consumer_caps = 0;
     btstack_hid_parser_init(&parser, hid_descriptor, hid_descriptor_len, HID_REPORT_TYPE_INPUT, report, length);
     while (btstack_hid_parser_has_more(&parser)) {
         uint16_t page = 0;
@@ -1129,11 +1138,17 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             bb_state_update_battery(true, percent, 1);
             continue;
         }
-        if (ultimate2c && page == 0x02 && (usage == 0xc4 || usage == 0xc5)) {
+        if ((ultimate2c || xbox) && page == 0x02 && (usage == 0xc4 || usage == 0xc5)) {
             primary_input = true;
+            if (xbox) xbox_sim_triggers = true;
             if (usage == 0xc5) { s.lt = generic_trigger(value, minimum, maximum); analog_lt = true; }
             else { s.rt = generic_trigger(value, minimum, maximum); analog_rt = true; }
             continue;
+        }
+        if (xbox && page == 0x0c && (usage == 0x0224 || usage == 0x0223 || usage == 0x01)) {
+            uint8_t target = usage == 0x0224 ? 13 : usage == 0x0223 ? 12 : 8;
+            xbox_consumer_caps |= 1u << target;
+            if (value) xbox_consumer_buttons |= 1u << target;
         }
         if (page != HID_USAGE_PAGE_GENERIC_DESKTOP) continue;
         if (usage >= HID_USAGE_X && usage <= HID_USAGE_HAT) primary_input = true;
@@ -1145,7 +1160,7 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             else if (usage == HID_USAGE_HAT) s.dpad = value >= minimum && value <= maximum ? hat_to_dpad(value - minimum) : 0;
             continue;
         }
-        if (identity.kind == BB_CONTROLLER_8BITDO) {
+        if (identity.kind == BB_CONTROLLER_8BITDO || xbox) {
             int index = -1;
             if (usage == HID_USAGE_X) index = 0;
             else if (usage == HID_USAGE_Y) index = 1;
@@ -1169,11 +1184,42 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             case HID_USAGE_Z: s.lt = generic_trigger(value, minimum, maximum); analog_lt = true; break;
             case HID_USAGE_RZ: s.rt = generic_trigger(value, minimum, maximum); analog_rt = true; break;
             case HID_USAGE_HAT:
-                if (arcade || m30 || micro) s.dpad = value >= minimum && value <= maximum ? hat_to_dpad(value - minimum) : 0;
-                else s.dpad = hat_to_dpad(value);
+                s.dpad = value >= minimum && value <= maximum ? hat_to_dpad(value - minimum) : 0;
                 break;
             default: break;
         }
+    }
+    if (xbox && !primary_input) {
+        // Battery/auxiliary reports must not replace the current gamepad state.
+        if (!xbox_consumer_caps) return true;
+        if (have_last_input_state) s = last_input_state;
+        s.buttons = (s.buttons & ~xbox_consumer_caps) | xbox_consumer_buttons;
+        submit_state(&s);
+        return true;
+    }
+    if (xbox) {
+        // Xbox descriptors use X/Y and Z/Rz for sticks. Older layouts put
+        // triggers on Rx/Ry; newer layouts use Simulation Controls instead.
+        if (axis_present[0]) s.x = hid_axis(axes[0], axis_minimum[0], axis_maximum[0]);
+        if (axis_present[1]) s.y = hid_axis(axes[1], axis_minimum[1], axis_maximum[1]);
+        if (axis_present[2]) s.rx = hid_axis(axes[2], axis_minimum[2], axis_maximum[2]);
+        if (axis_present[5]) s.ry = hid_axis(axes[5], axis_minimum[5], axis_maximum[5]);
+        if (!xbox_sim_triggers) {
+            if (axis_present[3]) s.lt = generic_trigger(axes[3], axis_minimum[3], axis_maximum[3]);
+            if (axis_present[4]) s.rt = generic_trigger(axes[4], axis_minimum[4], axis_maximum[4]);
+        }
+        const int8_t gap_map[16] = {0,1,-1,2,3,-1,4,5,-1,-1,8,9,12,10,11,13};
+        const int8_t sequential_map[15] = {0,1,2,3,4,5,8,9,10,11,12,-1,-1,-1,13};
+        const int8_t* map = xbox_sim_triggers ? gap_map : sequential_map;
+        uint8_t count = xbox_sim_triggers ? 16 : 15;
+        uint32_t buttons = 0, caps = 0;
+        for (uint8_t i = 0; i < count; ++i) {
+            if (map[i] >= 0) map_button_bit(s.buttons, button_capabilities, i, &buttons, &caps, (uint8_t)map[i]);
+        }
+        s.buttons = buttons | xbox_consumer_buttons;
+        button_capabilities = caps | xbox_consumer_caps | (1u << 6) | (1u << 7);
+        if (s.lt > 10) s.buttons |= 1u << 6;
+        if (s.rt > 10) s.buttons |= 1u << 7;
     }
     if (identity.kind == BB_CONTROLLER_8BITDO) {
         if (m30 || micro) {
@@ -1414,7 +1460,7 @@ bool bb_driver_refine_identity_from_hid_descriptor(const uint8_t* descriptor, ui
 }
 
 bool bb_driver_handle_xbox_ble_report(const uint8_t* report, uint16_t length) {
-    if (identity.kind != BB_CONTROLLER_XBOX_SERIES && identity.kind != BB_CONTROLLER_XBOX_ONE) return false;
+    if (identity.kind != BB_CONTROLLER_XBOX_WIRELESS && identity.kind != BB_CONTROLLER_XBOX_SERIES && identity.kind != BB_CONTROLLER_XBOX_ONE) return false;
     if (!report || !length) return false;
     if (length != 17 || report[0] != 1) return false;
     record_input_report(report, length);
@@ -1447,7 +1493,7 @@ bool bb_driver_handle_xbox_ble_report(const uint8_t* report, uint16_t length) {
     if (state.lt > 10) state.buttons |= 1u << 6;
     if (state.rt > 10) state.buttons |= 1u << 7;
     uint32_t capabilities = 0x1fff;
-    if (identity.kind == BB_CONTROLLER_XBOX_SERIES) {
+    if (identity.kind == BB_CONTROLLER_XBOX_SERIES || identity.kind == BB_CONTROLLER_XBOX_WIRELESS) {
         capabilities |= 1u << 13;
         if (report[16] & 1) state.buttons |= 1u << 13;
     }

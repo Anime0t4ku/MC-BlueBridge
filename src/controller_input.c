@@ -210,7 +210,7 @@ bb_controller_kind_t bb_controller_identify(uint16_t vid, uint16_t pid, const ch
         if (pid == 0x02e0 || pid == 0x02fd || pid == 0x02ea || pid == 0x0b20) return BB_CONTROLLER_XBOX_ONE;
         if (pid == 0x0b13) return BB_CONTROLLER_XBOX_SERIES;
         if (pid == 0x0b0a) return BB_CONTROLLER_XBOX_ADAPTIVE;
-        if (pid == 0x0b00) return BB_CONTROLLER_XBOX_ELITE;
+        if (pid == 0x0b00 || pid == 0x0b05 || pid == 0x0b22) return BB_CONTROLLER_XBOX_ELITE;
     }
     if (vid == 0x28de) {
         if (pid == 0x1302 || pid == 0x1304) return BB_CONTROLLER_STEAM2;
@@ -238,7 +238,10 @@ bb_controller_kind_t bb_controller_identify(uint16_t vid, uint16_t pid, const ch
     if (contains_ci(name, "pro controller")) return BB_CONTROLLER_SWITCH_PRO;
     if (contains_ci(name, "joy-con (l)")) return BB_CONTROLLER_JOYCON_LEFT;
     if (contains_ci(name, "joy-con (r)")) return BB_CONTROLLER_JOYCON_RIGHT;
-    if (contains_ci(name, "xbox")) return BB_CONTROLLER_XBOX_SERIES;
+    if (contains_ci(name, "xbox") && contains_ci(name, "adaptive")) return BB_CONTROLLER_XBOX_ADAPTIVE;
+    if (contains_ci(name, "xbox") && contains_ci(name, "series")) return BB_CONTROLLER_XBOX_SERIES;
+    if (contains_ci(name, "xbox one")) return BB_CONTROLLER_XBOX_ONE;
+    if (contains_ci(name, "xbox")) return BB_CONTROLLER_XBOX_WIRELESS;
     if (contains_ci(name, "8bitdo") || contains_ci(name, "pro 3")) return BB_CONTROLLER_8BITDO;
     if (contains_ci(name, "nimbus")) return BB_CONTROLLER_NIMBUS;
     if (contains_ci(name, "ouya")) return BB_CONTROLLER_OUYA;
@@ -267,7 +270,7 @@ const char* bb_controller_button_label(bb_controller_kind_t kind, const char* na
     if (kind == BB_CONTROLLER_DUALSENSE || kind == BB_CONTROLLER_DUALSENSE_EDGE) labels = dualsense;
     else if (kind == BB_CONTROLLER_DUALSHOCK4) labels = ds4;
     else if (kind == BB_CONTROLLER_DUALSHOCK3) labels = ds3;
-    else if (kind == BB_CONTROLLER_XBOX_ONE || kind == BB_CONTROLLER_XBOX_SERIES || kind == BB_CONTROLLER_XBOX_ADAPTIVE || kind == BB_CONTROLLER_XBOX_ELITE) labels = xbox;
+    else if (kind == BB_CONTROLLER_XBOX_WIRELESS || kind == BB_CONTROLLER_XBOX_ONE || kind == BB_CONTROLLER_XBOX_SERIES || kind == BB_CONTROLLER_XBOX_ADAPTIVE || kind == BB_CONTROLLER_XBOX_ELITE) labels = xbox;
     else if (kind == BB_CONTROLLER_STADIA) labels = stadia;
     else if (kind == BB_CONTROLLER_NSO_N64) labels = n64;
     else if (kind == BB_CONTROLLER_NSO_GAMECUBE) labels = gamecube;
@@ -421,6 +424,7 @@ bb_controller_capabilities_t bb_controller_capabilities(bb_controller_kind_t kin
             c.left_trigger = 0;
             c.right_trigger = 0;
             break;
+        case BB_CONTROLLER_XBOX_WIRELESS:
         case BB_CONTROLLER_XBOX_ONE:
         case BB_CONTROLLER_XBOX_ADAPTIVE:
             c.buttons = 0x00001fffu;
@@ -451,6 +455,7 @@ const char* bb_controller_kind_name(bb_controller_kind_t kind) {
         case BB_CONTROLLER_WII_REMOTE: return "Wii Remote";
         case BB_CONTROLLER_WII_CLASSIC: return "Wii Classic Controller";
         case BB_CONTROLLER_WII_BALANCE_BOARD: return "Wii Balance Board";
+        case BB_CONTROLLER_XBOX_WIRELESS: return "Xbox Wireless Controller";
         case BB_CONTROLLER_XBOX_ONE: return "Xbox One Controller";
         case BB_CONTROLLER_XBOX_SERIES: return "Xbox Series Controller";
         case BB_CONTROLLER_XBOX_ADAPTIVE: return "Xbox Adaptive Controller";

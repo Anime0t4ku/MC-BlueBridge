@@ -796,7 +796,7 @@ static bool send_wiiu_rumble(uint8_t strength) {
 }
 
 static bool xbox_ble_connected(void) {
-    return le_handle != HCI_CON_HANDLE_INVALID && hids_cid && (current_identity.kind == BB_CONTROLLER_XBOX_SERIES || current_identity.kind == BB_CONTROLLER_XBOX_ONE);
+    return le_handle != HCI_CON_HANDLE_INVALID && hids_cid && (current_identity.kind == BB_CONTROLLER_XBOX_WIRELESS || current_identity.kind == BB_CONTROLLER_XBOX_SERIES || current_identity.kind == BB_CONTROLLER_XBOX_ONE);
 }
 
 static bool send_xbox_ble_rumble(uint8_t strength) {
@@ -825,6 +825,7 @@ static bool send_xbox_ble_rumble(uint8_t strength) {
 static bool send_current_rumble(uint8_t strength) {
     switch (current_identity.kind) {
         case BB_CONTROLLER_XBOX_SERIES:
+        case BB_CONTROLLER_XBOX_WIRELESS:
         case BB_CONTROLLER_XBOX_ONE:
             return send_xbox_ble_rumble(strength);
         case BB_CONTROLLER_DUALSENSE:
