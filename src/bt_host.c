@@ -632,6 +632,8 @@ static void switch_setup_begin(void) {
 }
 
 static void service_switch_setup(uint32_t now) {
+    // Keep SNES in its default HID report mode, matching the generic-host approach.
+    if (current_identity.kind == BB_CONTROLLER_NSO_SNES) return;
     if (!classic_hid_cid || !classic_switch_protocol || switch_setup_state == 0 || (switch_setup_state == 7 && current_identity.kind != BB_CONTROLLER_NSO_N64) || switch_setup_state == 11) return;
     if ((int32_t)(now - switch_setup_at) < 0) return;
     bool sent = false;
@@ -1917,7 +1919,8 @@ static void classic_hid_event(uint8_t* packet) {
             if (len && report[0] == 0x21) switch_setup_ack(report, len);
             if (len && (report[0] == 0x30 || report[0] == 0x3f)) {
                 bool switch_kind = current_identity.kind == BB_CONTROLLER_NSO_NES || current_identity.kind == BB_CONTROLLER_NSO_SNES || current_identity.kind == BB_CONTROLLER_NSO_GENESIS || current_identity.kind == BB_CONTROLLER_NSO_N64 || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_8BITDO;
-                if (switch_kind) {
+                // Leave SNES report mode unchanged; skip Switch mode, rumble and LED setup.
+                if (switch_kind && current_identity.kind != BB_CONTROLLER_NSO_SNES) {
                     classic_switch_protocol = true;
                     if (switch_setup_state == 0 && !classic_switch_setup_sent) switch_setup_begin();
                 }
