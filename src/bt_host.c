@@ -139,6 +139,7 @@ typedef struct {
     uint8_t eightbitdo64_rumble_payload[4];
     bool eightbitdo64_rumble_write_pending;
     bool eightbitdo64_rumble_retry;
+    bool eightbitdo_ble_rumble;
     uint8_t dualsense_output_seq;
     uint8_t ds4_output_report[78];
     bool ds4_descriptor_ready;
@@ -409,6 +410,7 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
 #define eightbitdo64_rumble_payload (host_slots[bb_slot_current()].eightbitdo64_rumble_payload)
 #define eightbitdo64_rumble_write_pending (host_slots[bb_slot_current()].eightbitdo64_rumble_write_pending)
 #define eightbitdo64_rumble_retry (host_slots[bb_slot_current()].eightbitdo64_rumble_retry)
+#define eightbitdo_ble_rumble (host_slots[bb_slot_current()].eightbitdo_ble_rumble)
 #define dualsense_output_seq (host_slots[bb_slot_current()].dualsense_output_seq)
 #define ds4_output_report (host_slots[bb_slot_current()].ds4_output_report)
 #define ds4_descriptor_ready (host_slots[bb_slot_current()].ds4_descriptor_ready)
@@ -722,8 +724,13 @@ static bool send_switch_rumble(uint8_t strength) {
     return send_classic_report(classic_hid_cid, 0x10, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
 
+// 8BitDo controllers over BLE that take rumble as output report 5 (four 0-100
+// magnitudes, PID page Magnitude): the 8BitDo 64, and any other 8BitDo whose HID
+// descriptor declares that report (e.g. the Ultimate 2 Wireless, which reports
+// no VID/PID over BLE).
 static bool eightbitdo64_ble_connected(void) {
-    return le_handle != HCI_CON_HANDLE_INVALID && hids_cid && current_identity.kind == BB_CONTROLLER_8BITDO && current_identity.vendor_id == 0x2dc8 && current_identity.product_id == 0x3019;
+    return le_handle != HCI_CON_HANDLE_INVALID && hids_cid && current_identity.kind == BB_CONTROLLER_8BITDO &&
+        ((current_identity.vendor_id == 0x2dc8 && current_identity.product_id == 0x3019) || eightbitdo_ble_rumble);
 }
 
 static bool send_8bitdo64_ble_rumble(uint8_t strength) {
@@ -1281,6 +1288,7 @@ static void controller_disconnected(bool link_closed) {
     xbox_rumble_retry = false;
     eightbitdo64_rumble_write_pending = false;
     eightbitdo64_rumble_retry = false;
+    eightbitdo_ble_rumble = false;
     dualsense_output_seq = 0;
     switch_output_seq = 0;
     classic_switch_setup_sent = false;
@@ -1549,7 +1557,14 @@ static void hids_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pa
             if (size < 9 || le_handle == HCI_CON_HANDLE_INVALID) return;
             if (gattservice_subevent_hid_report_get_report_len(packet) > size - 9u) return;
             uint8_t service = gattservice_subevent_hid_report_get_service_index(packet);
-            bb_driver_set_hid_descriptor(hids_host_descriptor_storage_get_descriptor_data(hids_cid, service), hids_host_descriptor_storage_get_descriptor_len(hids_cid, service));
+            const uint8_t* descriptor = hids_host_descriptor_storage_get_descriptor_data(hids_cid, service);
+            uint16_t descriptor_len = hids_host_descriptor_storage_get_descriptor_len(hids_cid, service);
+            bb_driver_set_hid_descriptor(descriptor, descriptor_len);
+            if (!eightbitdo_ble_rumble && current_identity.kind == BB_CONTROLLER_8BITDO && descriptor && descriptor_len &&
+                btstack_hid_get_report_size_for_id(5, HID_REPORT_TYPE_OUTPUT, descriptor, descriptor_len) == 4) {
+                eightbitdo_ble_rumble = true;
+                bb_state_set_rumble_supported(true);
+            }
             last_controller_report_at = btstack_run_loop_get_time_ms();
             const uint8_t* report = gattservice_subevent_hid_report_get_report(packet);
             uint16_t length = gattservice_subevent_hid_report_get_report_len(packet);
