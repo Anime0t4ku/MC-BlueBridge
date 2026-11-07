@@ -1108,6 +1108,7 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
     bool analog_lt = false;
     bool analog_rt = false;
     bool xbox_sim_triggers = false;
+    bool eightbitdo_sim_triggers = false;
     uint32_t xbox_consumer_buttons = 0, xbox_consumer_caps = 0;
     btstack_hid_parser_init(&parser, hid_descriptor, hid_descriptor_len, HID_REPORT_TYPE_INPUT, report, length);
     while (btstack_hid_parser_has_more(&parser)) {
@@ -1138,9 +1139,10 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             bb_state_update_battery(true, percent, 1);
             continue;
         }
-        if ((ultimate2c || xbox) && page == 0x02 && (usage == 0xc4 || usage == 0xc5)) {
+        if ((ultimate2c || xbox || identity.kind == BB_CONTROLLER_8BITDO) && page == 0x02 && (usage == 0xc4 || usage == 0xc5)) {
             primary_input = true;
             if (xbox) xbox_sim_triggers = true;
+            else if (!ultimate2c) eightbitdo_sim_triggers = true;
             if (usage == 0xc5) { s.lt = generic_trigger(value, minimum, maximum); analog_lt = true; }
             else { s.rt = generic_trigger(value, minimum, maximum); analog_rt = true; }
             continue;
@@ -1235,6 +1237,14 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
                 if (dy < -16384) s.dpad |= 1;
                 if (dy > 16384) s.dpad |= 2;
             }
+        } else if (!ultimate2c && eightbitdo_sim_triggers && !axis_present[3] && !axis_present[4]) {
+            // D-input layout (e.g. Pro 2 firmware whose descriptor is not one of the
+            // exact matches above): triggers are Simulation Controls Accelerator/
+            // Brake, so X/Y and Z/Rz are the two sticks.
+            if (axis_present[0]) s.x = dinput_axis(axes[0]);
+            if (axis_present[1]) s.y = dinput_axis(axes[1]);
+            if (axis_present[2]) s.rx = dinput_axis(axes[2]);
+            if (axis_present[5]) s.ry = dinput_axis(axes[5]);
         } else if (!ultimate2c) apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
         normalize_8bitdo_buttons(&s, &button_capabilities, analog_lt, analog_rt);
     }
