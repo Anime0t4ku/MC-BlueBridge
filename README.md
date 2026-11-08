@@ -10,7 +10,7 @@ MC BlueBridge is free and open source.
 
 - Bluetooth Classic and Bluetooth Low Energy controller support
 - Support for many PlayStation, Xbox, Nintendo, 8BitDo and standard HID controllers
-- MiSTer, X-Input, Generic HID, Nintendo Switch and Xbox 360 console USB output modes
+- MiSTer, X-Input, Generic HID, Nintendo Switch, Xbox 360 console and DualSense USB output modes
 - Single-controller and two-controller modes
 - Remembered controllers with automatic reconnect
 - Multiple profiles per controller
@@ -158,7 +158,7 @@ Profiles can instead share one MiSTer identity when you want multiple BlueBridge
 
 ## USB output modes
 
-BlueBridge supports five USB output modes.
+BlueBridge supports six USB output modes.
 
 ### MiSTer
 
@@ -191,6 +191,16 @@ The required wired controller / USB controller option must be enabled on the con
 Presents BlueBridge as a wired Xbox 360 controller and uses XSM3 authentication for retail Xbox 360 consoles. This mode is separate from the normal X-Input mode used for PC compatibility.
 
 The native Xbox 360 USB layout does not expose the BlueBridge management interface. Configure and pair the adapter before switching to this mode. To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
+
+### DualSense
+
+Presents BlueBridge as a wired DualSense (PlayStation 5) controller.
+
+This is the recommended mode on **macOS**: macOS supports the DualSense natively over USB, so it works with games and apps that use Apple's Game Controller framework as well as with SDL-based apps such as Moonlight, and rumble is supported. It does not work on a PS5 console, which requires controller authentication.
+
+Buttons follow BlueBridge's positional layout: South is Cross, East is Circle, West is Square, North is Triangle, Select is Create, Start is Options, Home is the PS button and Capture is the touchpad button. The motion sensors report a controller lying still, and the touchpad reports no touches.
+
+Select the mode by its number (`6`) with the management command `BB1|1|OUTPUT_SET|6`. BlueBridge also exposes its management interface next to the controller in this mode, under the DualSense USB IDs (054C:0CE6). To return to MiSTer mode without a management connection, hold **BOOTSEL for 5 seconds** during normal operation.
 
 Changing USB output mode is persistent and automatically re-enumerates BlueBridge with the appropriate USB identity.
 
@@ -331,7 +341,7 @@ Rumble availability also depends on both the connected controller and the select
 
 Multi-controller mode is limited to two simultaneous controllers and may have slightly higher latency than single-controller mode.
 
-Xbox 360 (Console) output is available in single-controller mode only. The management interface is unavailable while the native Xbox 360 USB mode is active.
+Xbox 360 (Console) and DualSense output are available in single-controller mode only. The management interface is unavailable while the native Xbox 360 USB mode is active.
 
 ## Acknowledgments
 

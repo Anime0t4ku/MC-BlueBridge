@@ -49,6 +49,7 @@ add_executable(mc_bluebridge
   src/controller_driver.c
   src/hid_feedback.c
   src/xinput_device.c
+  src/dualsense_device.c
   src/xbox360_auth.c
   ${LIBXSM3_SOURCE_DIR}/xsm3.c
   ${LIBXSM3_SOURCE_DIR}/usbdsec.c
