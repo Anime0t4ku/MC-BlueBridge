@@ -1,6 +1,7 @@
 #include "usb_descriptors.h"
 #include "bluebridge_state.h"
 #include "xbox360_auth.h"
+#include "dualsense_descriptors.h"
 #include "pico/unique_id.h"
 #include <string.h>
 
@@ -44,6 +45,11 @@ uint8_t const* tud_descriptor_device_cb(void) {
         device_desc.idVendor = 0x045e;
         device_desc.idProduct = 0x028e;
         device_desc.bcdDevice = 0x0114;
+    } else if (mode == BB_OUTPUT_DUALSENSE) {
+        // Composite device (DualSense HID + CDC management).
+        device_desc.idVendor = BB_DS5_VID;
+        device_desc.idProduct = BB_DS5_PID;
+        device_desc.bcdDevice = BB_DS5_BCD;
     } else if (mode == BB_OUTPUT_SWITCH) {
         device_desc.idVendor = 0x0F0D;
         device_desc.idProduct = 0x0092;
@@ -150,6 +156,15 @@ static const uint8_t xbox360_config_desc[XBOX360_CONFIG_LEN] = {
     0x06,0x41,0x00,0x01,0x01,0x03
 };
 
+// DualSense layout: the HID gamepad interface (interrupt IN and OUT, 64 bytes,
+// 1 ms) on interface 0, followed by the CDC management interface.
+#define DUALSENSE_CONFIG_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN + TUD_CDC_DESC_LEN)
+static const uint8_t dualsense_config_desc[] = {
+    TUD_CONFIG_DESCRIPTOR(1, 3, 0, DUALSENSE_CONFIG_LEN, 0, 500),
+    TUD_HID_INOUT_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_NONE, sizeof(bb_ds5_report_descriptor), 0x02, 0x81, 64, 1),
+    TUD_CDC_DESCRIPTOR(1, 4, 0x83, 8, 0x04, 0x84, 64)
+};
+
 uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
     if (bb_multi_mode()) return multi_config_desc;
     (void)index;
@@ -157,6 +172,7 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
     if (mode == BB_OUTPUT_MISTER) return mister_config_desc;
     if (mode == BB_OUTPUT_XINPUT) return xinput_config_desc;
     if (mode == BB_OUTPUT_XBOX360) return xbox360_config_desc;
+    if (mode == BB_OUTPUT_DUALSENSE) return dualsense_config_desc;
     if (mode == BB_OUTPUT_SWITCH) return switch_config_desc;
     return hid_config_desc;
 }
@@ -164,6 +180,7 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
 uint8_t const* tud_hid_descriptor_report_cb(uint8_t instance) {
     (void)instance;
     if (bb_output_mode() == BB_OUTPUT_SWITCH) return switch_report_desc;
+    if (bb_output_mode() == BB_OUTPUT_DUALSENSE) return bb_ds5_report_descriptor;
     if (bb_output_mode() == BB_OUTPUT_MISTER) {
         memcpy(mister_report_desc, gamepad_report_desc, sizeof(gamepad_report_desc) - 1);
         memcpy(mister_report_desc + sizeof(gamepad_report_desc) - 1, pid_report_desc, sizeof(pid_report_desc));
@@ -180,9 +197,12 @@ static char serial_string[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
 static const char* string_for_index(uint8_t index) {
     bb_output_mode_t mode = bb_output_mode();
     switch (index) {
-        case 1: return mode == BB_OUTPUT_XBOX360 ? "\xC2\xA9Microsoft Corporation" : "MC BlueBridge";
+        case 1:
+            if (mode == BB_OUTPUT_DUALSENSE) return "Sony Interactive Entertainment";
+            return mode == BB_OUTPUT_XBOX360 ? "\xC2\xA9Microsoft Corporation" : "MC BlueBridge";
         case 2:
             if (mode == BB_OUTPUT_XBOX360) return "Xbox 360 Controller";
+            if (mode == BB_OUTPUT_DUALSENSE) return "DualSense Wireless Controller";
             bb_adapter_name_get(adapter_product_name, sizeof(adapter_product_name));
             return adapter_product_name;
         case 3:

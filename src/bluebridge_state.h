@@ -31,8 +31,11 @@ typedef enum {
     BB_OUTPUT_XINPUT = 2,
     BB_OUTPUT_GENERIC_HID = 3,
     BB_OUTPUT_SWITCH = 4,
-    BB_OUTPUT_XBOX360 = 5
+    BB_OUTPUT_XBOX360 = 5,
+    BB_OUTPUT_DUALSENSE = 6
 } bb_output_mode_t;
+
+#define BB_OUTPUT_LAST BB_OUTPUT_DUALSENSE
 
 typedef struct __attribute__((packed)) {
     int8_t x;

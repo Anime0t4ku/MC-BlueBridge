@@ -1,6 +1,7 @@
 #include "usb_device.h"
 #include "usb_descriptors.h"
 #include "xinput_device.h"
+#include "dualsense_device.h"
 #include "xbox360_auth.h"
 #include "hid_feedback.h"
 #include "cdc_protocol.h"
@@ -31,6 +32,7 @@ static uint8_t usb_slot;
 static bool reenumerate;
 static volatile bool usb_mounted;
 static uint32_t switch_last_send;
+static uint32_t dualsense_last_send;
 
 static bool same_digital_state(const bb_gamepad_report_t* a, const bb_gamepad_report_t* b) {
     return a->buttons == b->buttons && a->hat == b->hat;
@@ -199,6 +201,10 @@ static void send_pending(void) {
     } else if (mode == BB_OUTPUT_XBOX360) {
         report = latest_slots[usb_slot];
         send = true;
+    } else if (mode == BB_OUTPUT_DUALSENSE && (uint32_t)(to_ms_since_boot(get_absolute_time()) - dualsense_last_send) >= 4u) {
+        // A real DualSense streams input reports continuously.
+        report = latest_slots[usb_slot];
+        send = true;
     } else if (mode == BB_OUTPUT_SWITCH && (uint32_t)(to_ms_since_boot(get_absolute_time()) - switch_last_send) >= 15u) {
         report = latest_slots[usb_slot];
         send = true;
@@ -212,6 +218,12 @@ static void send_pending(void) {
     if (!send) return;
     bool ok = false;
     if (mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_XBOX360) ok = send_xinput(&report);
+    else if (mode == BB_OUTPUT_DUALSENSE) {
+        uint8_t body[BB_DS5_INPUT_SIZE];
+        bb_ds5_build_input(&report, body);
+        ok = tud_hid_n_report(usb_slot, 0x01, body, sizeof(body));
+        if (ok) dualsense_last_send = to_ms_since_boot(get_absolute_time());
+    }
     else if (mode == BB_OUTPUT_SWITCH) {
         ok = send_switch_state(&report);
         if (ok) switch_last_send = to_ms_since_boot(get_absolute_time());
@@ -282,6 +294,8 @@ static void handle_reenumeration(void) {
     tud_disconnect();
     sleep_ms(120);
     switch_last_send = 0;
+    dualsense_last_send = 0;
+    bb_ds5_reset();
     if (bb_output_mode() == BB_OUTPUT_XBOX360) bb_xbox360_auth_init();
     tud_connect();
 }
@@ -301,6 +315,7 @@ void bb_usb_core1(void) {
         }
         tud_task();
         if (bb_output_mode() == BB_OUTPUT_XBOX360) bb_xbox360_auth_task();
+        if (bb_output_mode() == BB_OUTPUT_DUALSENSE) bb_ds5_task();
         bb_usb_service_pending();
         bb_cdc_poll();
         handle_reenumeration();
@@ -345,12 +360,23 @@ void tud_resume_cb(void) {
 }
 
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t* buffer, uint16_t reqlen) {
+    if (bb_output_mode() == BB_OUTPUT_DUALSENSE && !bb_multi_mode()) {
+        if (instance != 0 || report_type != HID_REPORT_TYPE_FEATURE) return 0;
+        return bb_ds5_get_feature(report_id, buffer, reqlen);
+    }
     if (instance >= (bb_multi_mode() ? BB_MAX_SLOTS : 1) || bb_output_mode() != BB_OUTPUT_MISTER) return 0;
     bb_feedback_select(instance);
     return bb_feedback_get(report_id, report_type == HID_REPORT_TYPE_FEATURE, buffer, reqlen);
 }
 
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id, hid_report_type_t report_type, uint8_t const* buffer, uint16_t bufsize) {
+    if (bb_output_mode() == BB_OUTPUT_DUALSENSE && !bb_multi_mode()) {
+        // Output reports arrive on the interrupt OUT endpoint (report_id 0, ID in
+        // the first byte) or through SET_REPORT (ID already removed).
+        if (instance == 0 && (report_type == HID_REPORT_TYPE_OUTPUT || report_type == HID_REPORT_TYPE_INVALID))
+            bb_ds5_handle_output(report_id, buffer, bufsize);
+        return;
+    }
     if (instance >= (bb_multi_mode() ? BB_MAX_SLOTS : 1) || bb_output_mode() != BB_OUTPUT_MISTER || !buffer) return;
     if (report_type != HID_REPORT_TYPE_OUTPUT && report_type != HID_REPORT_TYPE_FEATURE) return;
     if (!report_id) {

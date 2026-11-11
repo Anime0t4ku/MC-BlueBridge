@@ -60,7 +60,8 @@ void bb_bootsel_poll(uint32_t now) {
         if (state.pairing) bb_platform_stop_pairing();
         else bb_platform_start_pairing();
     }
-    if (!recovery_action && held >= 5000u && bb_output_mode() == BB_OUTPUT_XBOX360) {
+    if (!recovery_action && held >= 5000u &&
+        (bb_output_mode() == BB_OUTPUT_XBOX360 || bb_output_mode() == BB_OUTPUT_DUALSENSE)) {
         recovery_action = true;
         bb_platform_stop_pairing();
         if (bb_output_mode_set(BB_OUTPUT_MISTER)) bb_usb_request_reenumeration();
