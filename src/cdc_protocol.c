@@ -73,8 +73,10 @@ static void send_status(const char* id) {
     bb_active_profile_get(&profile);
     uint8_t active_profile = bb_active_profile_index();
     uint8_t output_mode = bb_output_mode_value();
+    char bt_address[18];
+    bb_bt_host_local_address(bt_address, sizeof(bt_address));
     char out[1024];
-    snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"bt_ready\":%s,\"usb_ready\":%s,\"controller_connected\":%s,\"pairing\":%s,\"controller\":\"%s\",\"controller_index\":%d,\"active_profile\":%u,\"profile\":\"%s\",\"output_mode\":%u,\"output\":\"%s\",\"bt_reports\":%lu,\"usb_reports\":%lu,\"dropped_usb_reports\":%lu,\"raw_buttons\":%lu,\"button_capabilities\":%lu,\"battery_supported\":%s,\"battery_percent\":%u,\"battery_state\":%u,\"rumble_supported\":%s,\"capture_mode\":%u,\"xbox360_authenticated\":%s}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, state.bt_ready ? "true" : "false", state.usb_ready ? "true" : "false", state.controller_connected ? "true" : "false", state.pairing ? "true" : "false", state.controller_name, state.controller_index, active_profile, profile.name, output_mode, bb_output_mode_name((bb_output_mode_t)output_mode), (unsigned long)state.bt_reports, (unsigned long)state.usb_reports, (unsigned long)state.dropped_usb_reports, (unsigned long)state.raw_buttons, (unsigned long)state.button_capabilities, state.battery_supported ? "true" : "false", state.battery_percent, state.battery_state, state.rumble_supported ? "true" : "false", state.capture_mode, bb_xbox360_authenticated() ? "true" : "false");
+    snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"bt_ready\":%s,\"usb_ready\":%s,\"controller_connected\":%s,\"pairing\":%s,\"controller\":\"%s\",\"controller_index\":%d,\"active_profile\":%u,\"profile\":\"%s\",\"output_mode\":%u,\"output\":\"%s\",\"bt_reports\":%lu,\"usb_reports\":%lu,\"dropped_usb_reports\":%lu,\"raw_buttons\":%lu,\"button_capabilities\":%lu,\"battery_supported\":%s,\"battery_percent\":%u,\"battery_state\":%u,\"rumble_supported\":%s,\"capture_mode\":%u,\"xbox360_authenticated\":%s,\"bt_address\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, state.bt_ready ? "true" : "false", state.usb_ready ? "true" : "false", state.controller_connected ? "true" : "false", state.pairing ? "true" : "false", state.controller_name, state.controller_index, active_profile, profile.name, output_mode, bb_output_mode_name((bb_output_mode_t)output_mode), (unsigned long)state.bt_reports, (unsigned long)state.usb_reports, (unsigned long)state.dropped_usb_reports, (unsigned long)state.raw_buttons, (unsigned long)state.button_capabilities, state.battery_supported ? "true" : "false", state.battery_percent, state.battery_state, state.rumble_supported ? "true" : "false", state.capture_mode, bb_xbox360_authenticated() ? "true" : "false", bt_address);
     size_t pos = strlen(out);
     if (pos && out[pos - 1] == '}') {
         snprintf(out + pos - 1, sizeof(out) - pos + 1, ",\"multi_controller\":%s,\"max_connected\":%u,\"slot\":%u,\"turbo_available\":%s,\"macros_available\":%s}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_slot_current(), bb_multi_mode() ? "false" : "true", bb_multi_mode() ? "false" : "true");
@@ -352,7 +354,9 @@ static void handle_command(char* text) {
         bb_adapter_name_get(adapter_name, sizeof(adapter_name));
         bb_adapter_custom_name_get(custom_name, sizeof(custom_name));
         pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true,\"touch_mouse\":true,\"ds4_gyro\":true,\"ds4_lightbar\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
+        char bt_address[18];
+        bb_bt_host_local_address(bt_address, sizeof(bt_address));
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true,\"touch_mouse\":true,\"ds4_gyro\":true,\"ds4_lightbar\":true,\"bluetooth_address\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\",\"bt_address\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name, bt_address);
         send_ok(id, out);
         return;
     }
@@ -494,6 +498,14 @@ static void handle_command(char* text) {
     if (!strcmp(cmd, "CAPTURE_CLEAR")) {
         bb_capture_clear_result();
         send_ok(id, "cleared");
+        return;
+    }
+    if (!strcmp(cmd, "RUMBLE_GAIN")) {
+        char* value = next_field(&cursor);
+        if (value) bb_bt_host_set_ds3_big_gain((uint16_t)strtoul(value, NULL, 10));
+        char out[32];
+        snprintf(out, sizeof(out), "{\"ds3_big_gain\":%u}", bb_bt_host_ds3_big_gain());
+        send_ok(id, out);
         return;
     }
     if (!strcmp(cmd, "CONTROLLER_RUMBLE")) {

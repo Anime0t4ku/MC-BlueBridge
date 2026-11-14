@@ -14,6 +14,7 @@ typedef struct {
     uint16_t delay;
     uint16_t magnitude;
     int16_t offset;
+    uint16_t period;
     uint16_t attack_level;
     uint16_t fade_level;
     uint16_t attack_time;
@@ -30,6 +31,8 @@ typedef struct {
     uint32_t clock_now;
     uint32_t last_sent_at;
     uint8_t last_strength;
+    uint8_t last_left;    // big motor sent last
+    uint8_t last_right;   // small motor sent last
     uint8_t load_index;
     uint8_t load_status;
 } bb_feedback_context_t;
@@ -49,8 +52,35 @@ void bb_feedback_select(uint8_t slot) { if (slot < BB_MAX_SLOTS) feedback_slot =
 #define clock_now (feedback_slots[feedback_slot].clock_now)
 #define last_sent_at (feedback_slots[feedback_slot].last_sent_at)
 #define last_strength (feedback_slots[feedback_slot].last_strength)
+#define last_left (feedback_slots[feedback_slot].last_left)
+#define last_right (feedback_slots[feedback_slot].last_right)
 #define load_index (feedback_slots[feedback_slot].load_index)
 #define load_status (feedback_slots[feedback_slot].load_status)
+
+// ---- Recover both motors from Linux FF_RUMBLE ----
+// Linux has no rumble in hid-pidff, so ff-core turns an FF_RUMBLE effect into one sine of
+// magnitude strong/3 + weak/6 (drivers/input/ff-core.c compat_effect, period 50 ms). MiSTer
+// sends strong = big*257 and weak = small*257 (Main_MiSTer input.cpp set_rumble). With the
+// small motor either off or full (PSX DualShock, N64 Rumble Pak), the two cases never produce
+// the same magnitude, so both motors can be recovered exactly. Returns false otherwise.
+static int find_big(int32_t part) {
+    if (part < 0 || part > 21845) return -1;
+    // part = (big * 257) / 3 rounded down; big is about part * 3 / 257
+    int32_t guess = (part * 3) / 257;
+    for (int32_t b = guess - 1; b <= guess + 1; ++b) {
+        if (b >= 0 && b <= 255 && (b * 257) / 3 == part) return (int)b;
+    }
+    return -1;
+}
+
+static bool bb_rumble_decode(uint16_t magnitude, uint8_t* big, uint8_t* small) {
+    const int32_t small_full = (255 * 257) / 6;   // weak 0xffff / 6 = 10922
+    int b = find_big((int32_t)magnitude);
+    if (b >= 0) { *big = (uint8_t)b; *small = 0; return true; }
+    b = find_big((int32_t)magnitude - small_full);
+    if (b >= 0) { *big = (uint8_t)b; *small = 255; return true; }
+    return false;
+}
 
 static uint16_t read16(const uint8_t* p) {
     return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
@@ -71,6 +101,7 @@ void bb_feedback_stop(void) {
     for (unsigned i = 0; i < BB_EFFECT_COUNT; ++i) effects[i].playing = false;
     if (last_strength) bb_bt_host_set_slot_rumble(feedback_slot, 0, 0);
     last_strength = 0;
+    last_left = last_right = 0;
     last_sent_at = clock_now;
 }
 
@@ -83,6 +114,7 @@ void bb_feedback_reset(void) {
     load_status = 3;
     if (last_strength) bb_bt_host_set_slot_rumble(feedback_slot, 0, 0);
     last_strength = 0;
+    last_left = last_right = 0;
     last_sent_at = clock_now;
 }
 
@@ -139,6 +171,7 @@ void bb_feedback_set(uint8_t report_id, bool feature, const uint8_t* data, uint1
         uint16_t magnitude = read16(data + 1);
         effect->magnitude = magnitude > 32767 ? 32767 : magnitude;
         effect->offset = (int16_t)read16(data + 3);
+        effect->period = read16(data + 7);
     } else if (report_id == 4 && length == 9) {
         effect->attack_level = read16(data + 1);
         effect->fade_level = read16(data + 3);
@@ -182,6 +215,8 @@ uint16_t bb_feedback_get(uint8_t report_id, bool feature, uint8_t* data, uint16_
 void bb_feedback_poll(uint32_t now) {
     clock_now = now;
     uint32_t peak = 0;
+    unsigned playing = 0;
+    const bb_effect_t* only = NULL;
     if (enabled && !paused) {
         for (unsigned i = 0; i < BB_EFFECT_COUNT; ++i) {
             bb_effect_t* effect = &effects[i];
@@ -198,6 +233,8 @@ void bb_feedback_poll(uint32_t now) {
                 }
                 elapsed %= effect->duration;
             }
+            playing++;
+            only = effect;
             int32_t offset = effect->offset;
             if (offset < 0) offset = -offset;
             int32_t amplitude = effect->magnitude + offset;
@@ -214,9 +251,23 @@ void bb_feedback_poll(uint32_t now) {
         }
     }
     uint8_t strength = (uint8_t)peak;
-    if (strength != last_strength || (strength && (uint32_t)(now - last_sent_at) >= 250u)) {
-        bb_bt_host_set_slot_rumble(feedback_slot, strength, strength);
+    // A single plain rumble from Linux (FF_RUMBLE converted to a 50 ms sine at full gain) carries
+    // both motors exactly; recover them. Otherwise the motors stay unknown (0/0) and controllers
+    // with separate motors fall back to the merged strength.
+    uint8_t left = 0, right = 0;
+    uint8_t big, small;
+    if (playing == 1 && only->period == 50 && only->offset == 0 && !only->attack_time && !only->fade_time &&
+        only->gain == 255 && device_gain == 255 && bb_rumble_decode(only->magnitude, &big, &small)) {
+        left = big;
+        right = small;
+    }
+    bool changed = strength != last_strength || left != last_left || right != last_right;
+    if (changed || (strength && (uint32_t)(now - last_sent_at) >= 250u)) {
+        bb_bt_host_set_slot_rumble_motors(feedback_slot, strength, left, right);
         last_strength = strength;
+        last_left = left;
+        last_right = right;
         last_sent_at = now;
     }
 }
+
