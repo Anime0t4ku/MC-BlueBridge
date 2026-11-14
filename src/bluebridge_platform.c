@@ -1,4 +1,5 @@
 #include "bluebridge_platform.h"
+#include "bluebridge_state.h"
 #include "bt_host.h"
 
 void bb_platform_init(void) {
