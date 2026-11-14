@@ -64,29 +64,24 @@ This schema 14 is not compatible with schema 14-20 from the independent OLED
 fork. Do not flash this contribution over that fork or import its backups;
 use an upstream adapter/configuration for testing.
 
-The optional tools/companion_remote_mouse.py patches Companion Remote 4.2.0,
-which is a separate application. Review its GUI/API changes separately. It
-uses capability checks, backs up both target files before writing, validates
-Python syntax and supports rollback. Preview without installing:
-
-    python tools/companion_remote_mouse.py --preview /path/to/companion_remote.sh
-
-For testing on MiSTer, copy the script to /tmp/add_bluebridge_mouse.py, run it
-with Python 3, then restart Companion Remote. No firmware is written by this
-script. A future Companion Remote update can replace the local integration.
+The native Companion Remote web GUI integration is proposed separately:
+https://github.com/Anime0t4ku/mister-companion/pull/173
+It adds the mouse/gyro settings and light-bar controls directly to the bundled
+web daemon. No installer is included in this firmware contribution. Both PRs
+use the capability flags and CDC commands above, so the GUI remains compatible
+with older adapters and the independent hardware fork. The desktop controller
+panel is outside the Companion Remote web change.
 
 ## Validation
 
     python tests/run.py
-    python tests/test_companion_mouse.py /path/to/companion_remote.sh
-    node tests/test_companion_mouse.cjs
-    node tests/test_companion_lightbar.cjs
 
 CC selects a native C compiler. Tests cover packet CRC/bounds/history, contact
 changes, click/queue edges and rejected sends; gyro gating, inversion, timing,
 bias zeroing and fractional motion; colours, rumble and blink; persistence,
 record reuse, upstream schema-13 byte preservation, import validation/reset;
-and GUI/API dirty edits, adapter switches, capability fallback and validation.
+and rejected imports that must not trigger a restart. Companion Remote API/UI
+tests are included with the separate web GUI PR.
 
 The extracted upstream branch builds for Pico 2 W with Pico SDK 2.3.0 and GCC
 15.2.1. The same underlying features were physically tested in the user's
