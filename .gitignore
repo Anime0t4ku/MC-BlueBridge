@@ -2,7 +2,3 @@ build/
 .vscode/
 .idea/
 deps/btstack/
-
-build-host/
-build-ds4/
-__pycache__/
