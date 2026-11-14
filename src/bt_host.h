@@ -21,3 +21,4 @@ void bb_bt_host_set_slot_rumble_motors(uint8_t slot, uint8_t strength, uint8_t b
 void bb_bt_host_set_ds3_big_gain(uint16_t percent);
 uint16_t bb_bt_host_ds3_big_gain(void);
 void bb_bt_host_local_address(char* out, size_t size);
+void bb_bt_host_set_slot_ds3_leds(uint8_t slot, uint8_t leds);

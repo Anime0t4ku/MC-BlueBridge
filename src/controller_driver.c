@@ -1,6 +1,7 @@
 #include "controller_driver.h"
 #include "bluebridge_state.h"
 #include "usb_device.h"
+#include "bt_host.h"
 #include "btstack.h"
 #include "pico/stdlib.h"
 #include "ds4_gyro.h"
@@ -284,11 +285,108 @@ static uint32_t menu_chord_filter(uint32_t buttons) {
     }
 }
 
+// ---- Hold L3+R3 -> PlayStation analog mode ------------------------------------------------------
+// The MiSTer PSX core switches its DualShock to analog on L3+R3+Up (the original pad's ANALOG
+// button) and back to digital on L3+R3+Down. Holding L3+R3 for ANALOG_HOLD_MS adds a short Up or
+// Down press, alternating each hold (the adapter can't see the core's mode, so it sends the opposite
+// of what it sent last; if out of step, hold again). The first hold after connecting sends Up.
+// A DualShock 3 shows the hold on its LEDs: all off, then one LED stepping 1 -> 4 each second, then
+// all four flash for analog on, LED 1 alone for off. L3/R3 are passed through unchanged.
+#define BTN_L3 (1u << 10)
+#define BTN_R3 (1u << 11)
+#define ANALOG_HOLD_MS 5000u
+#define ANALOG_UP_MS 150u
+#define ANALOG_FLASH_MS 1200u
+#define ANALOG_TICK_MS 100u
+#define ANALOG_RELEASE_MS 300u   // stick clicks bounce: a release this short doesn't cancel the hold
+enum { ANALOG_IDLE, ANALOG_HOLDING, ANALOG_UP, ANALOG_DONE };
+typedef struct {
+    uint8_t state;
+    bool sent_on;      // last switch sent was Up (analog on)
+    bool releasing;    // L3+R3 let go during the hold: cancel only if it stays released
+    uint32_t released_at;
+    uint32_t started;
+    btstack_timer_source_t timer;
+} analog_hold_t;
+static analog_hold_t analog_holds[BB_MAX_SLOTS];
+static uint8_t analog_timer_slot[BB_MAX_SLOTS];
+
+static uint8_t analog_leds(uint32_t held, bool on) {   // DS3 LED bits 1..4 (0x02 = LED 1 ... 0x1e = all four)
+    if (held < ANALOG_HOLD_MS) {
+        uint32_t n = held * 5u / ANALOG_HOLD_MS;   // all off, then a single LED stepping 1 -> 4, a step per 1/5 of the hold
+        return n ? (uint8_t)(1u << n) : 0x01;      // LED n = bit n; 0x01 = all off (0 would mean "normal LED")
+    }
+    if (held - ANALOG_HOLD_MS >= ANALOG_FLASH_MS) return 0;   // back to normal
+    bool lit = !(((held - ANALOG_HOLD_MS) / 150u) & 1u);
+    return lit ? (on ? 0x1e : 0x02) : 0x01;   // flash all four (on) or LED 1 (off); 0x01 = all off
+}
+
+static void analog_hold_timer_handler(btstack_timer_source_t* ts);
+
+static void analog_hold_arm(uint8_t slot) {
+    analog_hold_t* a = &analog_holds[slot];
+    analog_timer_slot[slot] = slot;
+    btstack_run_loop_remove_timer(&a->timer);
+    btstack_run_loop_set_timer_handler(&a->timer, analog_hold_timer_handler);
+    btstack_run_loop_set_timer_context(&a->timer, &analog_timer_slot[slot]);
+    btstack_run_loop_set_timer(&a->timer, ANALOG_TICK_MS);
+    btstack_run_loop_add_timer(&a->timer);
+}
+
+// Returns the D-pad to send; updates the hold state and the DS3 LEDs.
+static uint8_t analog_hold_filter(uint8_t slot, uint32_t buttons, uint8_t dpad) {
+    if (slot >= BB_MAX_SLOTS) return dpad;
+    analog_hold_t* a = &analog_holds[slot];
+    bool both = (buttons & (BTN_L3 | BTN_R3)) == (BTN_L3 | BTN_R3);
+    uint32_t now = btstack_run_loop_get_time_ms();
+    uint32_t held = (uint32_t)(now - a->started);
+    if (a->state == ANALOG_IDLE) {
+        if (!both) return dpad;
+        a->state = ANALOG_HOLDING;
+        a->started = now;
+        a->releasing = false;
+        held = 0;
+    }
+    if (a->state == ANALOG_HOLDING) {
+        if (both) a->releasing = false;
+        else if (!a->releasing) { a->releasing = true; a->released_at = now; }
+        if (a->releasing && (uint32_t)(now - a->released_at) >= ANALOG_RELEASE_MS) {   // let go early: cancel
+            a->state = ANALOG_IDLE;
+            btstack_run_loop_remove_timer(&a->timer);
+            bb_bt_host_set_slot_ds3_leds(slot, 0);
+            return dpad;
+        }
+        if (a->releasing && held >= ANALOG_HOLD_MS) held = ANALOG_HOLD_MS - 1u;   // don't switch while let go
+    }
+    if (a->state == ANALOG_HOLDING && held >= ANALOG_HOLD_MS) { a->state = ANALOG_UP; a->sent_on = !a->sent_on; }
+    if (a->state == ANALOG_UP && (!both || held >= ANALOG_HOLD_MS + ANALOG_UP_MS)) a->state = ANALOG_DONE;
+    if (a->state == ANALOG_DONE && !both && held >= ANALOG_HOLD_MS + ANALOG_FLASH_MS) {   // flash over, released
+        a->state = ANALOG_IDLE;
+        btstack_run_loop_remove_timer(&a->timer);
+        bb_bt_host_set_slot_ds3_leds(slot, 0);
+        return dpad;
+    }
+    bb_bt_host_set_slot_ds3_leds(slot, analog_leds(held, a->sent_on));
+    if (a->state != ANALOG_DONE || held < ANALOG_HOLD_MS + ANALOG_FLASH_MS) analog_hold_arm(slot);
+    else btstack_run_loop_remove_timer(&a->timer);   // done and still held: wait for release
+    if (a->state == ANALOG_UP) return (uint8_t)(dpad | (a->sent_on ? BB_DPAD_UP : BB_DPAD_DOWN));
+    return dpad;
+}
+
+static void analog_hold_timer_handler(btstack_timer_source_t* ts) {
+    uint8_t slot = *(uint8_t*)btstack_run_loop_get_timer_context(ts);
+    uint8_t previous = bb_slot_current();
+    bb_slot_enter(slot);
+    if (menu_chords[slot].have_raw) submit_filtered(&menu_chords[slot].raw);
+    bb_slot_enter(previous);
+}
+
 static void submit_filtered(const bb_input_state_t* raw) {
     uint8_t slot = bb_slot_current();
     if (slot < BB_MAX_SLOTS) { menu_chords[slot].raw = *raw; menu_chords[slot].have_raw = true; }
     bb_input_state_t out = *raw;
     out.buttons = menu_chord_filter(raw->buttons);
+    out.dpad = analog_hold_filter(slot, raw->buttons, raw->dpad);
     bb_input_submit(&out);
 }
 
@@ -1638,6 +1736,9 @@ void bb_driver_reset(void) {
             btstack_run_loop_remove_timer(&menu_chords[slot].timer);
             menu_chords[slot].state = CHORD_IDLE;
             menu_chords[slot].have_raw = false;
+            btstack_run_loop_remove_timer(&analog_holds[slot].timer);
+            analog_holds[slot].state = ANALOG_IDLE;
+            analog_holds[slot].sent_on = false;
         }
     }
     bb_usb_touch_mouse_release();

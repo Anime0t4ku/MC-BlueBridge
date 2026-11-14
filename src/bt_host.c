@@ -154,6 +154,8 @@ typedef struct {
     volatile uint8_t queued_big;      // separate motors when the source has them (0 = unknown)
     volatile uint8_t queued_small;
     volatile uint16_t queued_duration;
+    volatile uint8_t led_override;    // DS3 LED override (bits 1..4 = LED1..4), 0 = normal (LED 1)
+    volatile bool led_override_pending;
     uint8_t motor_big;                // motors of the rumble being played
     uint8_t motor_small;
     bool rumble_active;
@@ -436,6 +438,8 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
 #define rumble_request_big (host_slots[bb_slot_current()].queued_big)
 #define rumble_request_small (host_slots[bb_slot_current()].queued_small)
 #define rumble_motor_big (host_slots[bb_slot_current()].motor_big)
+#define ds3_leds (host_slots[bb_slot_current()].led_override)
+#define ds3_leds_pending (host_slots[bb_slot_current()].led_override_pending)
 #define rumble_motor_small (host_slots[bb_slot_current()].motor_small)
 #define rumble_request_duration_ms (host_slots[bb_slot_current()].queued_duration)
 #define rumble_active (host_slots[bb_slot_current()].rumble_active)
@@ -690,7 +694,7 @@ static bool send_ds3_rumble(uint8_t strength) {
         report[3] = strength >= DS3_SMALL_MOTOR_THRESHOLD ? 0x01 : 0x00;
         report[5] = (uint8_t)(strength > 85u ? 255u : strength * 3u);
     }
-    report[10] = 0x02;
+    report[10] = ds3_leds ? (uint8_t)(ds3_leds & 0x1e) : 0x02;   // override 0x01 = all LEDs off
     for (uint8_t i = 0; i < 4; ++i) {
         uint8_t o = (uint8_t)(11u + i * 5u);
         report[o] = 0xff;
@@ -1033,6 +1037,10 @@ static bool send_current_rumble(uint8_t strength) {
 
 static void service_rumble(void) {
     uint32_t now = btstack_run_loop_get_time_ms();
+    if (ds3_leds_pending) {   // LED change (e.g. the analog-hold progress bar): resend with the current motors
+        if (current_identity.kind != BB_CONTROLLER_DUALSHOCK3 || !classic_hid_cid) ds3_leds_pending = false;
+        else if (send_ds3_rumble(rumble_active ? rumble_active_strength : 0)) ds3_leds_pending = false;
+    }
     if (rumble_request_pending) {
         uint8_t strength = rumble_request_strength;
         uint16_t duration = rumble_request_duration_ms;
@@ -2899,6 +2907,15 @@ void bb_bt_host_local_address(char* out, size_t size) {
     bd_addr_t addr;
     gap_local_bd_addr(addr);
     snprintf(out, size, "%s", bd_addr_to_str(addr));
+}
+
+// LED override for a DualShock 3 (bits 1..4 = LED1..4, 0x01 = all off); 0 restores the normal LED.
+// Other pads ignore it.
+void bb_bt_host_set_slot_ds3_leds(uint8_t slot, uint8_t leds) {
+    if (slot >= BB_MAX_SLOTS) return;
+    if (host_slots[slot].led_override == leds) return;
+    host_slots[slot].led_override = leds;
+    host_slots[slot].led_override_pending = true;
 }
 
 void bb_bt_host_set_slot_rumble(uint8_t slot, uint8_t left, uint8_t right) {
