@@ -6,6 +6,9 @@ Controllers connect to BlueBridge over Bluetooth, while BlueBridge presents them
 
 MC BlueBridge is free and open source.
 
+This contribution adds optional DS4 touchpad/gyro mouse output and configurable
+light-bar themes with a low-battery warning. See [DS4 setup, protocol and validation](docs/DS4.md).
+
 ## Features
 
 - Bluetooth Classic and Bluetooth Low Energy controller support
