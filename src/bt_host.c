@@ -2255,6 +2255,13 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             break;
         case BTSTACK_EVENT_STATE:
             if (btstack_event_state_get_state(packet) == HCI_STATE_WORKING) {
+                // Listen for reconnecting controllers often enough that pages are heard while
+                // another controller is connected and LE scanning shares the radio: 11.25 ms
+                // every 160 ms, interlaced (BlueZ fast connectable). The controller default is
+                // 11.25 ms every 1.28 s, standard. Set here because power-on resets BTstack's
+                // pending GAP tasks.
+                gap_set_page_scan_activity(0x0100, 0x0012);
+                gap_set_page_scan_type(PAGE_SCAN_MODE_INTERLACED);
                 stack_ready = true;
                 bb_state_set_bt_ready(true);
                 start_scans();
