@@ -140,6 +140,7 @@ typedef struct {
     uint8_t descriptor_storage[8192];
     const uint8_t* hid_descriptor;
     uint16_t hid_descriptor_len;
+    int8_t descriptor_menu_button;   // -1 = not checked yet for this descriptor
     bb_input_state_t last_input_state;
     bool have_last_input_state;
     bool pro2_home_pressed;
@@ -171,6 +172,7 @@ static bb_driver_context_t driver_slots[BB_MAX_SLOTS] = {
 #define identity (driver_slots[bb_slot_current()].identity)
 #define hid_descriptor (driver_slots[bb_slot_current()].hid_descriptor)
 #define hid_descriptor_len (driver_slots[bb_slot_current()].hid_descriptor_len)
+#define descriptor_menu_button (driver_slots[bb_slot_current()].descriptor_menu_button)
 #define last_input_state (driver_slots[bb_slot_current()].last_input_state)
 #define have_last_input_state (driver_slots[bb_slot_current()].have_last_input_state)
 #define pro2_home_pressed (driver_slots[bb_slot_current()].pro2_home_pressed)
@@ -562,6 +564,8 @@ static bool is_ultimate2c(void) {
     return identity.kind == BB_CONTROLLER_8BITDO && identity.vendor_id == 0x2dc8 && identity.product_id == 0x301b;
 }
 
+static bool descriptor_has_menu_button(void);
+
 static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabilities, bool analog_lt, bool analog_rt) {
     if (!state || !capabilities) return;
     uint32_t src_buttons = state->buttons;
@@ -596,6 +600,17 @@ static void normalize_8bitdo_buttons(bb_input_state_t* state, uint32_t* capabili
     if (!pro3 && model) {
         static const uint8_t sequential[] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13};
         static const uint8_t paddles[] = {0,1,17,2,3,16,4,5,6,7,8,9,12,10,11,13};
+        // X-input mode over Bluetooth (Home in its own System Main Menu report): Xbox button order
+        // A B X Y LB RB View Menu LS RS, and the triggers are analog axes only.
+        static const uint8_t xinput[] = {0,1,2,3,4,5,8,9,10,11};
+        if (!(src_caps & 0xffffc000u) && descriptor_has_menu_button()) {
+            map_8bitdo_layout(state, capabilities, xinput, sizeof(xinput));
+            if (analog_lt) *capabilities |= 1u << 6;
+            if (analog_rt) *capabilities |= 1u << 7;
+            if (state->lt > 10) state->buttons |= 1u << 6;   // the triggers also press L2/R2, as on Xbox pads
+            if (state->rt > 10) state->buttons |= 1u << 7;
+            return;
+        }
         if (src_caps & 0xffffc000u) map_8bitdo_layout(state, capabilities, paddles, sizeof(paddles));
         else map_8bitdo_layout(state, capabilities, sequential, sizeof(sequential));
         if (!analog_lt && (state->buttons & (1u << 6))) state->lt = 255;
@@ -1305,6 +1320,23 @@ static bool is_xbox_controller(void) {
            identity.kind == BB_CONTROLLER_XBOX_ADAPTIVE;
 }
 
+// 8BitDo pads in X-input mode over Bluetooth (e.g. SN30 Pro) send Home as a separate report:
+// Generic Desktop System Main Menu (0x85), like the arcade stick. True when the descriptor has one.
+static bool descriptor_has_menu_button(void) {
+    if (!hid_descriptor || !hid_descriptor_len) return false;
+    if (descriptor_menu_button >= 0) return descriptor_menu_button == 1;
+    bool found = false;
+    btstack_hid_usage_iterator_t iterator;
+    btstack_hid_usage_iterator_init(&iterator, hid_descriptor, hid_descriptor_len, HID_REPORT_TYPE_INPUT);
+    while (btstack_hid_usage_iterator_has_more(&iterator)) {
+        btstack_hid_usage_item_t item;
+        btstack_hid_usage_iterator_get_item(&iterator, &item);
+        if (item.usage_page == HID_USAGE_PAGE_GENERIC_DESKTOP && item.usage == 0x85) { found = true; break; }
+    }
+    descriptor_menu_button = found ? 1 : 0;
+    return found;
+}
+
 static bool parse_generic(const uint8_t* report, uint16_t length) {
     if (!hid_descriptor || !hid_descriptor_len || !report || !length) return false;
     btstack_hid_parser_t parser;
@@ -1315,6 +1347,8 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
     bool m30 = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("m30");
     bool micro = identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("micro");
     bool xbox = is_xbox_controller();
+    // Home arrives in its own report (arcade stick, or an 8BitDo pad in X-input mode)
+    bool home_report = arcade || (identity.kind == BB_CONTROLLER_8BITDO && descriptor_has_menu_button());
     if (arcade || m30 || micro || xbox) {
         bool numbered = btstack_hid_report_id_declared(hid_descriptor, hid_descriptor_len);
         int expected = btstack_hid_get_report_size_for_id(numbered ? report[0] : HID_REPORT_ID_UNDEFINED, HID_REPORT_TYPE_INPUT, hid_descriptor, hid_descriptor_len);
@@ -1341,7 +1375,7 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         int32_t minimum = m30 ? parser.descriptor_usage_item.global_logical_minimum : parser.usage_iterator.global_logical_minimum;
         int32_t maximum = parser.usage_iterator.global_logical_maximum;
         btstack_hid_parser_get_field(&parser, &page, &usage, &value);
-        if (arcade && ((page == HID_USAGE_PAGE_GENERIC_DESKTOP && usage == 0x85) || (page == 0x0c && usage == 0x0223))) {
+        if (home_report && ((page == HID_USAGE_PAGE_GENERIC_DESKTOP && usage == 0x85) || (page == 0x0c && usage == 0x0223))) {
             home_present = true;
             home_pressed |= value != 0;
             continue;
@@ -1468,6 +1502,15 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
             if (axis_present[1]) s.y = dinput_axis(axes[1]);
             if (axis_present[2]) s.rx = dinput_axis(axes[2]);
             if (axis_present[5]) s.ry = dinput_axis(axes[5]);
+        } else if (!ultimate2c && descriptor_has_menu_button()) {
+            // X-input mode (fixed Xbox layout): X/Y left stick, Rx/Ry right stick (16-bit),
+            // Z/Rz the triggers (10-bit). The D-input axis guessing would misread these.
+            if (axis_present[0]) s.x = hid_axis(axes[0], axis_minimum[0], axis_maximum[0]);
+            if (axis_present[1]) s.y = hid_axis(axes[1], axis_minimum[1], axis_maximum[1]);
+            if (axis_present[3]) s.rx = hid_axis(axes[3], axis_minimum[3], axis_maximum[3]);
+            if (axis_present[4]) s.ry = hid_axis(axes[4], axis_minimum[4], axis_maximum[4]);
+            if (axis_present[2]) { s.lt = generic_trigger(axes[2], axis_minimum[2], axis_maximum[2]); analog_lt = true; }
+            if (axis_present[5]) { s.rt = generic_trigger(axes[5], axis_minimum[5], axis_maximum[5]); analog_rt = true; }
         } else if (!ultimate2c) apply_8bitdo_axes(&s, axes, axis_present, axis_minimum, axis_maximum, &analog_lt, &analog_rt);
         normalize_8bitdo_buttons(&s, &button_capabilities, analog_lt, analog_rt);
     }
@@ -1478,13 +1521,22 @@ static bool parse_generic(const uint8_t* report, uint16_t length) {
         if (analog_rt) button_capabilities |= 1u << 7;
         s.lt = s.rt = 0;
     }
-    if (arcade && home_present) {
+    if (home_report && home_present) {
+        if (!primary_input && !arcade) {
+            // a Home-only report: keep the rest of the pad state and the button capabilities as they are
+            if (have_last_input_state) s = last_input_state;
+            s.buttons &= ~(1u << 12);
+            if (home_pressed) s.buttons |= 1u << 12;
+            submit_state(&s);
+            return true;
+        }
         if (!primary_input && have_last_input_state) s = last_input_state;
         s.buttons &= ~(1u << 12);
         if (home_pressed) s.buttons |= 1u << 12;
         button_capabilities |= 1u << 12;
-    } else if (arcade && have_last_input_state) {
+    } else if (home_report && have_last_input_state) {
         s.buttons |= last_input_state.buttons & (1u << 12);
+        if (!arcade) button_capabilities |= 1u << 12;
     }
     s.buttons = canonicalize_buttons(s.buttons);
     if (identity.kind == BB_CONTROLLER_8BITDO && eightbitdo_name_has("nes30") &&
@@ -1573,6 +1625,12 @@ static bool parse_8bitdo_arcade(const uint8_t* report, uint16_t length) {
     return parse_generic(report, length);
 }
 
+// 8BitDo in X-input mode (its descriptor has the separate System Main Menu report): rumble then
+// uses the Xbox-style output report 3 instead of the D-input report 5.
+bool bb_driver_8bitdo_xinput_mode(void) {
+    return identity.kind == BB_CONTROLLER_8BITDO && descriptor_has_menu_button();
+}
+
 void bb_driver_reset(void) {
     {
         uint8_t slot = bb_slot_current();
@@ -1589,6 +1647,7 @@ void bb_driver_reset(void) {
     memset(&identity, 0, sizeof(identity));
     hid_descriptor = NULL;
     hid_descriptor_len = 0;
+    descriptor_menu_button = -1;
     diagnostic_report_length = 0;
     diagnostic_report_original_length = 0;
     diagnostic_report_sequence = 0;
@@ -1648,6 +1707,7 @@ void bb_driver_set_hid_descriptor(const uint8_t* descriptor, uint16_t length) {
         hid_descriptor = storage;
         hid_descriptor_len = length;
     }
+    descriptor_menu_button = -1;
     if (have_early_arcade_battery_report && bb_driver_battery_report_id() == 4 && bb_driver_battery_report_type() == HID_REPORT_TYPE_INPUT) {
         bb_driver_handle_battery_report(early_arcade_battery_report, sizeof(early_arcade_battery_report));
     }
