@@ -47,6 +47,9 @@ add_executable(mc_bluebridge
   src/bt_host.c
   src/controller_input.c
   src/controller_driver.c
+  src/touch_mouse.c
+  src/ds4_gyro.c
+  src/lightbar.c
   src/hid_feedback.c
   src/xinput_device.c
   src/dualsense_device.c

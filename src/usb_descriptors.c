@@ -114,6 +114,15 @@ static const uint8_t mister_config_desc[] = {
     TUD_HID_DESCRIPTOR(COMPOSITE_ITF_GAMEPAD, 5, HID_ITF_PROTOCOL_NONE, sizeof(mister_report_desc), 0x83, 16, 1)
 };
 
+static const uint8_t touch_mouse_report_desc[]={TUD_HID_REPORT_DESC_MOUSE()};
+#define TOUCH_CONFIG_LEN (COMPOSITE_CONFIG_LEN+TUD_HID_DESC_LEN)
+static const uint8_t touch_config_desc[]={
+    TUD_CONFIG_DESCRIPTOR(1,4,0,TOUCH_CONFIG_LEN,0,100),
+    TUD_CDC_DESCRIPTOR(0,4,0x81,8,0x02,0x82,64),
+    TUD_HID_DESCRIPTOR(2,5,HID_ITF_PROTOCOL_NONE,sizeof(mister_report_desc),0x83,16,1),
+    TUD_HID_DESCRIPTOR(3,0,HID_ITF_PROTOCOL_NONE,sizeof(touch_mouse_report_desc),0x84,8,1)
+};
+
 #define MULTI_CONFIG_LEN (TUD_CONFIG_DESC_LEN + TUD_CDC_DESC_LEN + BB_MAX_SLOTS * TUD_HID_DESC_LEN)
 static const uint8_t multi_config_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 2 + BB_MAX_SLOTS, 0, MULTI_CONFIG_LEN, 0, 100),
@@ -169,7 +178,7 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
     if (bb_multi_mode()) return multi_config_desc;
     (void)index;
     bb_output_mode_t mode = bb_output_mode();
-    if (mode == BB_OUTPUT_MISTER) return mister_config_desc;
+    if (mode == BB_OUTPUT_MISTER) return bb_touch_mouse_current()?touch_config_desc:mister_config_desc;
     if (mode == BB_OUTPUT_XINPUT) return xinput_config_desc;
     if (mode == BB_OUTPUT_XBOX360) return xbox360_config_desc;
     if (mode == BB_OUTPUT_DUALSENSE) return dualsense_config_desc;
@@ -178,7 +187,7 @@ uint8_t const* tud_descriptor_configuration_cb(uint8_t index) {
 }
 
 uint8_t const* tud_hid_descriptor_report_cb(uint8_t instance) {
-    (void)instance;
+    if(instance==1 && !bb_multi_mode() && bb_touch_mouse_current() && bb_output_mode()==BB_OUTPUT_MISTER)return touch_mouse_report_desc;
     if (bb_output_mode() == BB_OUTPUT_SWITCH) return switch_report_desc;
     if (bb_output_mode() == BB_OUTPUT_DUALSENSE) return bb_ds5_report_descriptor;
     if (bb_output_mode() == BB_OUTPUT_MISTER) {

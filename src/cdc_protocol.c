@@ -256,6 +256,36 @@ static char* next_field(char** cursor) {
     return start;
 }
 
+static bool next_unsigned(char** cursor,uint32_t limit,uint32_t* out) {
+    char* field=next_field(cursor);uint32_t n=0;
+    if(!field||!*field)return false;
+    for(const char* p=field;*p;p++) {
+        if(*p<'0'||*p>'9')return false;
+        uint32_t digit=(uint32_t)(*p-'0');
+        if(digit>limit || n>(limit-digit)/10u)return false;
+        n=n*10u+digit;
+    }
+    *out=n;return true;
+}
+static void send_lightbar(const char* id) {
+    bb_lightbar_config_t cfg;bb_lightbar_get(&cfg);
+    static char out[2048];
+    size_t pos=(size_t)snprintf(out,sizeof(out),"{\"theme\":%u,\"players\":[",cfg.theme);
+    for(unsigned i=0;i<4;i++)pos+=(size_t)snprintf(out+pos,sizeof(out)-pos,"%s[%u,%u,%u]",i?",":"",cfg.players[i].r,cfg.players[i].g,cfg.players[i].b);
+    pos+=(size_t)snprintf(out+pos,sizeof(out)-pos,"],\"controllers\":[");
+    bool first=true;
+    for(uint8_t i=0;i<BB_MAX_CONTROLLERS;i++) {
+        uint32_t cid;bb_lightbar_choice_t choice;
+        if(!bb_lightbar_controller_get(i,&cid,&choice))continue;
+        int slot=bb_controller_slot(i);
+        bb_rgb_t rgb=bb_lightbar_colour(i,slot>=0?(unsigned)slot:0);
+        pos+=(size_t)snprintf(out+pos,sizeof(out)-pos,"%s{\"index\":%u,\"id\":%lu,\"player\":%u,\"custom_enabled\":%s,\"rgb\":[%u,%u,%u],\"slot\":%d,\"effective_rgb\":[%u,%u,%u]}",
+            first?"":",",i,(unsigned long)cid,choice.player,choice.custom_enabled?"true":"false",choice.rgb.r,choice.rgb.g,choice.rgb.b,slot,rgb.r,rgb.g,rgb.b);
+        first=false;
+    }
+    snprintf(out+pos,sizeof(out)-pos,"]}");send_ok(id,out);
+}
+
 static void handle_command(char* text) {
     char* cursor = text;
     char* proto = next_field(&cursor);
@@ -263,13 +293,66 @@ static void handle_command(char* text) {
     char* cmd = next_field(&cursor);
     if (!proto || strcmp(proto, "BB1") || !id || !cmd) return;
 
+    if(!strcmp(cmd,"LIGHTBAR_GET")) {
+        if(cursor){send_err(id,"lightbar");return;}send_lightbar(id);return;
+    }
+    if(!strcmp(cmd,"LIGHTBAR_PALETTE_SET")) {
+        uint32_t theme,v;bb_rgb_t rgb[4];
+        if(!next_unsigned(&cursor,2,&theme)){send_err(id,"lightbar_theme");return;}
+        for(unsigned i=0;i<12;i++) {
+            if(!next_unsigned(&cursor,255,&v)){send_err(id,"lightbar_colour");return;}
+            ((uint8_t*)rgb)[i]=(uint8_t)v;
+        }
+        if(cursor||!bb_lightbar_palette_set((uint8_t)theme,rgb)){send_err(id,"lightbar_palette");return;}
+        send_ok(id,"saved");return;
+    }
+    if(!strcmp(cmd,"LIGHTBAR_SET")) {
+        uint32_t v[7];const uint32_t limits[]={BB_MAX_CONTROLLERS-1,UINT32_MAX,4,1,255,255,255};
+        for(unsigned i=0;i<7;i++)if(!next_unsigned(&cursor,limits[i],&v[i])){send_err(id,"lightbar");return;}
+        bb_lightbar_choice_t choice={(uint8_t)v[2],(uint8_t)v[3],{(uint8_t)v[4],(uint8_t)v[5],(uint8_t)v[6]}};
+        if(cursor||!bb_lightbar_controller_set((uint8_t)v[0],v[1],choice)){send_err(id,"lightbar_controller");return;}
+        send_ok(id,"saved");return;
+    }
+
+    if(!strcmp(cmd,"DS4_AIM_GET")) {
+        bb_ds4_aim_t a=bb_ds4_aim_get(),active=bb_ds4_aim_current();
+        char out[256];snprintf(out,sizeof(out),"{\"enabled\":%u,\"sensitivity\":%u,\"activation\":%u,\"flags\":%u,\"pause_button\":%u,\"restart_required\":%s}",
+            a.enabled,a.sensitivity,a.activation,a.flags,a.pause_button,memcmp(&a,&active,sizeof(a))?"true":"false");
+        send_ok(id,out);return;
+    }
+    if(!strcmp(cmd,"DS4_AIM_SET")) {
+        uint8_t fields[6];
+        for(unsigned i=0;i<6;i++) {
+            char* field=next_field(&cursor);char* end;
+            if(!field||!*field){send_err(id,"ds4_aim");return;}
+            for(char* p=field;*p;p++)if(*p<'0'||*p>'9'){send_err(id,"ds4_aim");return;}
+            unsigned long n=strtoul(field,&end,10);
+            if(*end||n>255){send_err(id,"ds4_aim");return;}fields[i]=(uint8_t)n;
+        }
+        bb_ds4_aim_t a={fields[0],fields[1],fields[2],fields[3],fields[4]};
+        if(cursor||fields[5]>1||!bb_ds4_pointer_settings_set(a,fields[5]!=0)){send_err(id,"ds4_aim");return;}
+        bb_ds4_aim_t active=bb_ds4_aim_current();char out[64];
+        snprintf(out,sizeof(out),"{\"restart_required\":%s}",(memcmp(&a,&active,sizeof(a))||bb_touch_mouse_get()!=bb_touch_mouse_current())?"true":"false");send_ok(id,out);return;
+    }
+    if(!strcmp(cmd,"TOUCH_MOUSE_GET")) {
+        char out[160];snprintf(out,sizeof(out),"{\"enabled\":%s,\"active\":%s,\"available\":%s}",
+            bb_touch_mouse_get()?"true":"false",bb_touch_mouse_current()?"true":"false",
+            !bb_multi_mode()&&bb_output_mode()==BB_OUTPUT_MISTER?"true":"false");send_ok(id,out);return;
+    }
+    if(!strcmp(cmd,"TOUCH_MOUSE_SET")) {
+        char* value=next_field(&cursor);
+        if(!value||cursor||(strcmp(value,"0")&&strcmp(value,"1"))){send_err(id,"touch_mouse");return;}
+        bb_touch_mouse_set(value[0]=='1');
+        char out[80];snprintf(out,sizeof(out),"{\"restart_required\":%s}",bb_touch_mouse_get()!=bb_touch_mouse_current()?"true":"false");
+        send_ok(id,out);return;
+    }
     if (!strcmp(cmd, "HELLO")) {
         char out[768], adapter_name[BB_MAX_NAME], custom_name[BB_MAX_NAME];
         char adapter_id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
         bb_adapter_name_get(adapter_name, sizeof(adapter_name));
         bb_adapter_custom_name_get(custom_name, sizeof(custom_name));
         pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true,\"touch_mouse\":true,\"ds4_gyro\":true,\"ds4_lightbar\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name);
         send_ok(id, out);
         return;
     }
@@ -586,7 +669,7 @@ static void handle_command(char* text) {
         char* size = next_field(&cursor);
         char* checksum = next_field(&cursor);
         int schema_value = schema ? atoi(schema) : 0;
-        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value == 12 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V12_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11 && schema_value != 12))) {
+        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value == 12 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V12_SIZE) || (schema_value == 13 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V13_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 13 && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11 && schema_value != 12))) {
             import_active = false;
             send_err(id, "config_header");
             return;
