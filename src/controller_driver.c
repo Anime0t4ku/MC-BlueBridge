@@ -184,6 +184,112 @@ static bb_driver_context_t driver_slots[BB_MAX_SLOTS] = {
 #define n64_below (driver_slots[bb_slot_current()].n64_below)
 #define n64_above (driver_slots[bb_slot_current()].n64_above)
 
+// ---- Select+Start -> Home (menu) chord ---------------------------------------------------------
+// MiSTer accepts one menu trigger per mapping, and in multi-controller mode every pad shares one
+// mapping. So pads without a Home button get one: hold Select+Start for MENU_CHORD_MS and BlueBridge
+// sends Home instead (MiSTer Menu = Home then works on every pad). Select/Start are held back while
+// the chord is pending; a shorter press is passed on as Select+Start (briefly) so in-game combos such
+// as soft reset still work. Pads that report a Home button are left alone.
+#define BTN_SELECT (1u << 8)
+#define BTN_START (1u << 9)
+#define BTN_HOME (1u << 12)
+#define MENU_CHORD_MS 600u
+#define MENU_CHORD_TAP_MS 60u
+#define MENU_CHORD_HOME_TAP_MS 100u
+enum { CHORD_IDLE, CHORD_PENDING, CHORD_ACTIVE, CHORD_RELEASING, CHORD_TAP };
+typedef struct {
+    uint8_t state;
+    uint32_t started;
+    bb_input_state_t raw;
+    bool have_raw;
+    btstack_timer_source_t timer;
+} menu_chord_t;
+static menu_chord_t menu_chords[BB_MAX_SLOTS];
+static uint8_t menu_chord_timer_slot[BB_MAX_SLOTS];
+
+static void submit_filtered(const bb_input_state_t* raw);
+
+static void menu_chord_timer_handler(btstack_timer_source_t* ts) {
+    uint8_t slot = *(uint8_t*)btstack_run_loop_get_timer_context(ts);
+    uint8_t previous = bb_slot_current();
+    bb_slot_enter(slot);
+    if (menu_chords[slot].have_raw) submit_filtered(&menu_chords[slot].raw);
+    bb_slot_enter(previous);
+}
+
+static void menu_chord_arm(uint8_t slot, uint32_t delay_ms) {
+    menu_chord_t* c = &menu_chords[slot];
+    menu_chord_timer_slot[slot] = slot;
+    btstack_run_loop_remove_timer(&c->timer);
+    btstack_run_loop_set_timer_handler(&c->timer, menu_chord_timer_handler);
+    btstack_run_loop_set_timer_context(&c->timer, &menu_chord_timer_slot[slot]);
+    btstack_run_loop_set_timer(&c->timer, delay_ms);
+    btstack_run_loop_add_timer(&c->timer);
+}
+
+static uint32_t menu_chord_filter(uint32_t buttons) {
+    uint8_t slot = bb_slot_current();
+    if (slot >= BB_MAX_SLOTS) return buttons;
+    menu_chord_t* c = &menu_chords[slot];
+    bb_runtime_state_t rt;
+    bb_state_get(&rt);
+    if (rt.button_capabilities & BTN_HOME) { c->state = CHORD_IDLE; return buttons; }
+    uint32_t now = btstack_run_loop_get_time_ms();
+    bool both = (buttons & (BTN_SELECT | BTN_START)) == (BTN_SELECT | BTN_START);
+    bool any = (buttons & (BTN_SELECT | BTN_START)) != 0;
+    switch (c->state) {
+        case CHORD_IDLE:
+            if (!both) return buttons;
+            c->state = CHORD_PENDING;
+            c->started = now;
+            menu_chord_arm(slot, MENU_CHORD_MS);
+            return buttons & ~(BTN_SELECT | BTN_START);
+        case CHORD_PENDING:
+            if (both) {
+                uint32_t held = (uint32_t)(now - c->started);
+                if (held < MENU_CHORD_MS) { menu_chord_arm(slot, MENU_CHORD_MS - held); return buttons & ~(BTN_SELECT | BTN_START); }
+                c->state = CHORD_ACTIVE;
+                c->started = now;
+                menu_chord_arm(slot, MENU_CHORD_HOME_TAP_MS);
+                return (buttons & ~(BTN_SELECT | BTN_START)) | BTN_HOME;
+            }
+            // released early: pass a short Select+Start through, then the real state
+            c->state = CHORD_TAP;
+            c->started = now;
+            menu_chord_arm(slot, MENU_CHORD_TAP_MS);
+            return buttons | BTN_SELECT | BTN_START;
+        case CHORD_TAP:
+            if ((uint32_t)(now - c->started) < MENU_CHORD_TAP_MS) { menu_chord_arm(slot, MENU_CHORD_TAP_MS - (uint32_t)(now - c->started)); return buttons | BTN_SELECT | BTN_START; }
+            c->state = both ? CHORD_RELEASING : CHORD_IDLE;
+            return both ? (buttons & ~(BTN_SELECT | BTN_START)) : buttons;
+        case CHORD_ACTIVE:
+            // Home is sent as a short tap as soon as the hold is reached: MiSTer opens its menu on
+            // the release of the menu button, so holding Home until Select+Start were let go made
+            // the menu wait for the release.
+            if ((uint32_t)(now - c->started) < MENU_CHORD_HOME_TAP_MS) {
+                menu_chord_arm(slot, MENU_CHORD_HOME_TAP_MS - (uint32_t)(now - c->started));
+                return (buttons & ~(BTN_SELECT | BTN_START)) | BTN_HOME;
+            }
+            c->state = CHORD_RELEASING;   // tap done: swallow Select/Start until both are up
+            if (any) return buttons & ~(BTN_SELECT | BTN_START);
+            c->state = CHORD_IDLE;
+            return buttons;
+        case CHORD_RELEASING:   // swallow the leftover Select or Start until both are up
+        default:
+            if (any) return buttons & ~(BTN_SELECT | BTN_START);
+            c->state = CHORD_IDLE;
+            return buttons;
+    }
+}
+
+static void submit_filtered(const bb_input_state_t* raw) {
+    uint8_t slot = bb_slot_current();
+    if (slot < BB_MAX_SLOTS) { menu_chords[slot].raw = *raw; menu_chords[slot].have_raw = true; }
+    bb_input_state_t out = *raw;
+    out.buttons = menu_chord_filter(raw->buttons);
+    bb_input_submit(&out);
+}
+
 static void submit_state(const bb_input_state_t* state) {
     if (!state) return;
     bb_input_state_t normalized = *state;
@@ -198,7 +304,7 @@ static void submit_state(const bb_input_state_t* state) {
     }
     last_input_state = normalized;
     have_last_input_state = true;
-    bb_input_submit(&normalized);
+    submit_filtered(&normalized);
 }
 
 static int16_t axis12_quantized(uint16_t value, uint16_t center, uint16_t range) {
@@ -1468,6 +1574,14 @@ static bool parse_8bitdo_arcade(const uint8_t* report, uint16_t length) {
 }
 
 void bb_driver_reset(void) {
+    {
+        uint8_t slot = bb_slot_current();
+        if (slot < BB_MAX_SLOTS) {
+            btstack_run_loop_remove_timer(&menu_chords[slot].timer);
+            menu_chords[slot].state = CHORD_IDLE;
+            menu_chords[slot].have_raw = false;
+        }
+    }
     bb_usb_touch_mouse_release();
     memset(&driver_slots[bb_slot_current()].pointer,0,sizeof(bb_ds4_pointer_t));
     memset(&driver_slots[bb_slot_current()].ds4_gyro,0,sizeof(bb_ds4_gyro_t));
