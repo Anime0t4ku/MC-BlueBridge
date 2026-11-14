@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 static uint32_t ds4_lightbar_crc_byte(uint32_t crc,uint8_t byte) {
     crc^=byte;
@@ -787,9 +788,33 @@ static bool send_8bitdo64_ble_rumble(uint8_t strength) {
     return false;
 }
 
+#define XINPUT_RUMBLE_MIN 20u
+#define XINPUT_RUMBLE_FULL 170u
+
 static bool send_8bitdo_dinput_rumble(uint8_t strength) {
     if (eightbitdo64_ble_connected()) return send_8bitdo64_ble_rumble(strength);
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_8BITDO || classic_switch_protocol) return false;
+    if (bb_driver_8bitdo_xinput_mode()) {
+        // X-input mode: Xbox One S style report 3 = enable bits (0 weak, 1 strong motor), magnitudes
+        // 0..100 for left trigger, right trigger, strong, weak, then duration (10 ms units), start
+        // delay and loop count. The D-input report 5 below is ignored in this mode.
+        // These motors run clearly even at low levels, while an original DualShock's big motor only
+        // starts spinning at about 0x50-0x60. Gran Turismo 2 holds the big motor at 0x55 for most of
+        // a race (merged strength ~56), which became a constant buzz with a linear mapping. Map the
+        // merged strength (0..170 for the big motor) on a x^1.5 curve above XINPUT_RUMBLE_MIN:
+        // 56 -> ~12%, 100 -> ~40%, 121 -> ~55%, 170 -> 100%; below the minimum is off.
+        uint8_t magnitude = 0;
+        if (strength >= XINPUT_RUMBLE_MIN) {
+            float x = (float)(strength - XINPUT_RUMBLE_MIN) / (float)(XINPUT_RUMBLE_FULL - XINPUT_RUMBLE_MIN);
+            if (x > 1.0f) x = 1.0f;
+            magnitude = (uint8_t)(x * sqrtf(x) * 100.0f + 0.5f);
+            if (!magnitude) magnitude = 1;
+        }
+        // Always enable both motors and stop with zero magnitudes (as Linux hid-microsoft does):
+        // a report with the enable bits cleared is ignored, so the motors ran on for the duration.
+        uint8_t xinput[8] = {0x03, 0, 0, magnitude, magnitude, 0xff, 0, 0};
+        return send_classic_report(classic_hid_cid, 0x03, xinput, sizeof(xinput)) == ERROR_CODE_SUCCESS;
+    }
     uint8_t payload[4] = {strength, strength, 0, 0};
     return send_classic_report(classic_hid_cid, 0x05, payload, sizeof(payload)) == ERROR_CODE_SUCCESS;
 }
