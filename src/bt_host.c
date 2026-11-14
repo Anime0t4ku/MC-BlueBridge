@@ -176,6 +176,9 @@ typedef struct {
     uint8_t switch_setup_state;
     uint8_t switch_setup_retries;
     uint32_t switch_setup_at;
+    uint8_t snes_led_state;
+    uint8_t snes_led_retries;
+    uint32_t snes_led_at;
     bool manual_disconnect_pending;
     uint32_t manual_disconnect_at;
     uint8_t wiiu_setup_step;
@@ -446,6 +449,9 @@ bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
 #define classic_switch_protocol (host_slots[bb_slot_current()].classic_switch_protocol)
 #define switch_setup_state (host_slots[bb_slot_current()].switch_setup_state)
 #define switch_setup_retries (host_slots[bb_slot_current()].switch_setup_retries)
+#define snes_led_state (host_slots[bb_slot_current()].snes_led_state)
+#define snes_led_retries (host_slots[bb_slot_current()].snes_led_retries)
+#define snes_led_at (host_slots[bb_slot_current()].snes_led_at)
 #define switch_setup_at (host_slots[bb_slot_current()].switch_setup_at)
 #define manual_disconnect_pending (host_slots[bb_slot_current()].manual_disconnect_pending)
 #define manual_disconnect_at (host_slots[bb_slot_current()].manual_disconnect_at)
@@ -702,10 +708,45 @@ static void service_switch_setup(uint32_t now) {
     }
 }
 
+// SNES controllers stay in their default report mode (see service_switch_setup), so they
+// never receive the player LED and keep flashing. Send only the player LED subcommand.
+enum { SNES_LED_IDLE = 0, SNES_LED_PENDING, SNES_LED_WAIT_ACK, SNES_LED_DONE };
+
+static void snes_led_begin(uint32_t now) {
+    if (snes_led_state != SNES_LED_IDLE) return;
+    snes_led_state = SNES_LED_PENDING;
+    snes_led_retries = 0;
+    snes_led_at = now + 300u;
+}
+
+static void service_snes_led(uint32_t now) {
+    if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_NSO_SNES) return;
+    if (snes_led_state != SNES_LED_PENDING && snes_led_state != SNES_LED_WAIT_ACK) return;
+    if ((int32_t)(now - snes_led_at) < 0) return;
+    if (snes_led_state == SNES_LED_WAIT_ACK) {
+        if (snes_led_retries >= 3) {
+            snes_led_state = SNES_LED_DONE;
+            return;
+        }
+        snes_led_retries++;
+        snes_led_state = SNES_LED_PENDING;
+    }
+    if (send_switch_subcommand(0x30, 0x01)) {
+        snes_led_state = SNES_LED_WAIT_ACK;
+        snes_led_at = now + 600u;
+    } else {
+        snes_led_at = now + 200u;
+    }
+}
+
 static void switch_setup_ack(const uint8_t* report, uint16_t len) {
     if (!report || len < 15 || report[0] != 0x21 || !(report[13] & 0x80u)) return;
     uint8_t subcommand = report[14];
     uint32_t now = btstack_run_loop_get_time_ms();
+    if (snes_led_state == SNES_LED_WAIT_ACK && subcommand == 0x30 && current_identity.kind == BB_CONTROLLER_NSO_SNES) {
+        snes_led_state = SNES_LED_DONE;
+        return;
+    }
     if (switch_setup_state == 2 && subcommand == 0x03) {
         switch_setup_state = 3;
         switch_setup_retries = 0;
@@ -1332,6 +1373,9 @@ static void controller_disconnected(bool link_closed) {
     switch_setup_state = 0;
     switch_setup_retries = 0;
     switch_setup_at = 0;
+    snes_led_state = SNES_LED_IDLE;
+    snes_led_retries = 0;
+    snes_led_at = 0;
     manual_disconnect_pending = false;
     manual_disconnect_at = 0;
     wiiu_setup_step = 0;
@@ -1975,6 +2019,7 @@ static void classic_hid_event(uint8_t* packet) {
                     classic_switch_protocol = true;
                     if (switch_setup_state == 0 && !classic_switch_setup_sent) switch_setup_begin();
                 }
+                if (current_identity.kind == BB_CONTROLLER_NSO_SNES) snes_led_begin(btstack_run_loop_get_time_ms());
             }
             last_controller_report_at = btstack_run_loop_get_time_ms();
             bb_driver_handle_hid_report(report, len);
@@ -2345,6 +2390,7 @@ static void service_slot(void) {
     }
     service_classic_identity();
     service_switch_setup(now);
+    service_snes_led(now);
     bb_runtime_state_t live_state;
     bb_state_get(&live_state);
     bool nintendo_stream = current_identity.kind == BB_CONTROLLER_NSO_N64 || current_identity.kind == BB_CONTROLLER_SWITCH_PRO || current_identity.kind == BB_CONTROLLER_JOYCON_LEFT || current_identity.kind == BB_CONTROLLER_JOYCON_RIGHT || current_identity.kind == BB_CONTROLLER_SWITCH2_PRO || current_identity.kind == BB_CONTROLLER_NSO_GAMECUBE;
