@@ -15,6 +15,41 @@
 #include "tusb.h"
 #include <string.h>
 
+static int32_t ds4_mouse_bounded(int32_t x){return x>32767?32767:x< -32767?-32767:x;}
+void bb_mouse_queue_push(bb_mouse_queue_t* q,bb_pointer_sample_t s) {
+    if(q->count) {
+        bb_mouse_event_t* e=&q->events[(q->head+q->count-1u)%8];
+        if(e->buttons==s.buttons){e->x=ds4_mouse_bounded(e->x+s.x);e->y=ds4_mouse_bounded(e->y+s.y);return;}
+    } else if(!s.x&&!s.y&&s.buttons==q->last_buttons)return;
+    if(q->count==8){q->head=(q->head+1u)%8;--q->count;++q->overflows;}
+    unsigned tail=(q->head+q->count)%8;
+    q->events[tail]=(bb_mouse_event_t){.x=s.x,.y=s.y,.buttons=s.buttons,.sequence=++q->sequence};
+    ++q->count;
+}
+bool bb_mouse_queue_peek(const bb_mouse_queue_t* q,bb_pointer_sample_t* out,uint32_t* token) {
+    if(!q->count)return false;
+    const bb_mouse_event_t* e=&q->events[q->head];
+    *out=(bb_pointer_sample_t){.x=(int16_t)(e->x>127?127:e->x< -127?-127:e->x),
+        .y=(int16_t)(e->y>127?127:e->y< -127?-127:e->y),.buttons=e->buttons};
+    *token=e->sequence;return true;
+}
+void bb_mouse_queue_ack(bb_mouse_queue_t* q,uint32_t token,bb_pointer_sample_t sent) {
+    q->last_buttons=sent.buttons;
+    if(!q->count||q->events[q->head].sequence!=token)return;
+    bb_mouse_event_t* e=&q->events[q->head];e->x-=sent.x;e->y-=sent.y;
+    if(!e->x&&!e->y){q->head=(q->head+1u)%8;--q->count;}
+}
+void bb_mouse_queue_release(bb_mouse_queue_t* q) {
+    q->head=q->count=0;
+    bb_mouse_queue_push(q,(bb_pointer_sample_t){0});
+}
+
+void bb_mouse_queue_expire_motion(bb_mouse_queue_t* q) {
+    for(unsigned i=0;i<q->count;i++) {
+        bb_mouse_event_t* e=&q->events[(q->head+i)%8];e->x=e->y=0;e->sequence=++q->sequence;
+    }
+}
+
 static critical_section_t usb_lock;
 static volatile bool usb_lock_ready;
 #define BB_USB_QUEUE_DEPTH 8
@@ -33,6 +68,48 @@ static bool reenumerate;
 static volatile bool usb_mounted;
 static uint32_t switch_last_send;
 static uint32_t dualsense_last_send;
+
+static bb_mouse_queue_t mouse_queue;
+static uint32_t mouse_sample_at;
+static bool mouse_event_driven,mouse_motion_expired;
+
+bool bb_usb_touch_mouse_enabled(void) {
+    if(!bb_touch_mouse_current()||bb_multi_mode()||bb_output_mode()!=BB_OUTPUT_MISTER)return false;
+    bb_runtime_state_t state;bb_state_get(&state);
+    return state.controller_connected && state.capture_mode==BB_CAPTURE_NONE;
+}
+void bb_usb_touch_mouse_submit(bb_pointer_sample_t sample,bool event_driven) {
+    if(!usb_lock_ready)return;
+    critical_section_enter_blocking(&usb_lock);
+    mouse_event_driven=event_driven;mouse_motion_expired=false;
+    bb_mouse_queue_push(&mouse_queue,sample);
+    mouse_sample_at=to_ms_since_boot(get_absolute_time());
+    critical_section_exit(&usb_lock);
+}
+void bb_usb_touch_mouse_release(void) {
+    if(!usb_lock_ready)return;
+    critical_section_enter_blocking(&usb_lock);mouse_event_driven=false;bb_mouse_queue_release(&mouse_queue);
+    critical_section_exit(&usb_lock);
+}
+static void service_touch_mouse(void) {
+    if(!bb_touch_mouse_current()||bb_multi_mode()||bb_output_mode()!=BB_OUTPUT_MISTER)return;
+    bool eligible=bb_usb_touch_mouse_enabled();
+    uint32_t now=to_ms_since_boot(get_absolute_time()),token;
+    bb_pointer_sample_t sample;
+    critical_section_enter_blocking(&usb_lock);
+    bool stale=(uint32_t)(now-mouse_sample_at)>500u;
+    if(!eligible||(!mouse_event_driven&&stale))bb_mouse_queue_release(&mouse_queue);
+    else if(stale&&!mouse_motion_expired) {
+        bb_mouse_queue_expire_motion(&mouse_queue);mouse_motion_expired=true;
+    }
+    bool have=bb_mouse_queue_peek(&mouse_queue,&sample,&token);
+    critical_section_exit(&usb_lock);
+    /* Mouse is HID instance 1; gamepad remains instance 0 and is serviced first. */
+    if(have&&tud_hid_n_ready(1)&&tud_hid_n_mouse_report(1,0,sample.buttons,(int8_t)sample.x,(int8_t)sample.y,0,0)) {
+        critical_section_enter_blocking(&usb_lock);bb_mouse_queue_ack(&mouse_queue,token,sample);
+        critical_section_exit(&usb_lock);
+    }
+}
 
 static bool same_digital_state(const bb_gamepad_report_t* a, const bb_gamepad_report_t* b) {
     return a->buttons == b->buttons && a->hat == b->hat;
@@ -269,6 +346,7 @@ static void send_pending(void) {
 void bb_usb_service_pending(void) {
     for (usb_slot = 0; usb_slot < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++usb_slot) send_pending();
     usb_slot = 0;
+    service_touch_mouse();
 }
 
 static void feedback_reset_all(void) {
@@ -289,6 +367,7 @@ static void handle_reenumeration(void) {
     critical_section_exit(&usb_lock);
     if (!requested) return;
     usb_mounted = false;
+    bb_usb_touch_mouse_release();
     bb_state_set_usb_ready(false);
     feedback_reset_all();
     tud_disconnect();
@@ -344,6 +423,7 @@ void tud_mount_cb(void) {
 }
 
 void tud_umount_cb(void) {
+    bb_usb_touch_mouse_release();
     feedback_reset_all();
     usb_mounted = false;
     bb_state_set_usb_ready(false);

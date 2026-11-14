@@ -1,4 +1,5 @@
 #include "bt_host.h"
+#include "lightbar.h"
 #include <stdio.h>
 #include "bluebridge_state.h"
 #include "controller_driver.h"
@@ -21,6 +22,24 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
+
+static uint32_t ds4_lightbar_crc_byte(uint32_t crc,uint8_t byte) {
+    crc^=byte;
+    for(unsigned i=0;i<8;i++)crc=(crc>>1)^((crc&1u)?0xedb88320u:0);
+    return crc;
+}
+void bb_ds4_output_build(uint8_t p[78],uint8_t strength,bb_rgb_t colour,bool low_battery,bool update_blink) {
+    memset(p,0,78);p[0]=0x11;p[1]=0xc4;p[3]=update_blink?0x07:0x03;
+    p[6]=strength;p[7]=strength;p[8]=colour.r;p[9]=colour.g;p[10]=colour.b;
+    /* DS4 hardware timing is in 10 ms units: 1 s on, 1 s off. Sending
+     * zero for both durations restores a solid light. Only update blink timing
+     * when it changes, so repeated rumble reports cannot restart its phase. */
+    p[11]=low_battery?100:0;p[12]=low_battery?100:0;
+    uint32_t crc=ds4_lightbar_crc_byte(0xffffffffu,0xa2);
+    for(unsigned i=0;i<74;i++)crc=ds4_lightbar_crc_byte(crc,p[i]);
+    crc=~crc;
+    for(unsigned i=0;i<4;i++)p[74+i]=(uint8_t)(crc>>(8*i));
+}
 
 #if defined(ENABLE_LE_SECURE_CONNECTIONS) && (BTSTACK_VERSION_MAJOR > 1 || (BTSTACK_VERSION_MAJOR == 1 && (BTSTACK_VERSION_MINOR > 8 || (BTSTACK_VERSION_MINOR == 8 && BTSTACK_VERSION_PATCH >= 2))))
 #define BB_SM_DEFAULT_SC_ONLY true
@@ -142,6 +161,10 @@ typedef struct {
     bool eightbitdo_ble_rumble;
     uint8_t dualsense_output_seq;
     uint8_t ds4_output_report[78];
+    bb_rgb_t ds4_lightbar_sent;
+    bool ds4_lightbar_valid;
+    bool ds4_low_battery,ds4_blink_sent;
+    uint32_t ds4_lightbar_retry_at;
     bool ds4_descriptor_ready;
     bool ds4_activation_pending;
     uint32_t ds4_activation_at;
@@ -555,19 +578,28 @@ static bool send_switch_report_mode(uint8_t mode) {
 static bool send_ds4_rumble(uint8_t strength) {
     if (!classic_hid_cid || current_identity.kind != BB_CONTROLLER_DUALSHOCK4 || ds4_activation_step == 2) return false;
     uint8_t* report = ds4_output_report;
-    memset(report, 0, sizeof(ds4_output_report));
-    report[0] = 0x11;
-    report[1] = 0xc4;
-    report[3] = 0x07;
-    report[6] = strength;
-    report[7] = strength;
-    report[10] = 0x40;
-    uint32_t crc = dualsense_output_crc(report, 74);
-    report[74] = (uint8_t)crc;
-    report[75] = (uint8_t)(crc >> 8);
-    report[76] = (uint8_t)(crc >> 16);
-    report[77] = (uint8_t)(crc >> 24);
-    return send_classic_report(classic_hid_cid, 0x11, &report[1], 77) == ERROR_CODE_SUCCESS;
+    bb_rgb_t colour=bb_lightbar_colour((unsigned)current_controller_index,bb_slot_current());
+    bb_runtime_state_t state;bb_state_get(&state);
+    bb_host_context_t* slot=&host_slots[bb_slot_current()];
+    slot->ds4_low_battery=bb_ds4_low_battery_blink(slot->ds4_low_battery,state.battery_supported,state.battery_percent,state.battery_state);
+    bool update_blink=!slot->ds4_lightbar_valid||slot->ds4_blink_sent!=slot->ds4_low_battery;
+    bb_ds4_output_build(report,strength,colour,slot->ds4_low_battery,update_blink);
+    bool sent=send_classic_report(classic_hid_cid, 0x11, &report[1], 77) == ERROR_CODE_SUCCESS;
+    if(sent){slot->ds4_lightbar_sent=colour;slot->ds4_lightbar_valid=true;slot->ds4_blink_sent=slot->ds4_low_battery;}
+    return sent;
+}
+
+static void service_ds4_lightbar(uint32_t now) {
+    if(!classic_hid_cid||current_controller_index<0||current_identity.kind!=BB_CONTROLLER_DUALSHOCK4||
+       ds4_activation_pending||ds4_activation_step==2||manual_disconnect_pending)return;
+    bb_host_context_t* slot=&host_slots[bb_slot_current()];
+    bb_runtime_state_t state;bb_state_get(&state);
+    slot->ds4_low_battery=bb_ds4_low_battery_blink(slot->ds4_low_battery,state.battery_supported,state.battery_percent,state.battery_state);
+    bb_rgb_t colour=bb_lightbar_colour((unsigned)current_controller_index,bb_slot_current());
+    if(slot->ds4_lightbar_valid&&slot->ds4_blink_sent==slot->ds4_low_battery&&!memcmp(&colour,&slot->ds4_lightbar_sent,sizeof(colour)))return;
+    if((int32_t)(now-slot->ds4_lightbar_retry_at)<0)return;
+    slot->ds4_lightbar_retry_at=now+100u;
+    send_ds4_rumble(rumble_active?rumble_active_strength:0);
 }
 
 static bool send_ds3_activation(void) {
@@ -1249,6 +1281,10 @@ static void controller_disconnected(bool link_closed) {
     ds4_descriptor_ready = false;
     ds4_activation_pending = false;
     ds4_activation_step = 0;
+    host_slots[bb_slot_current()].ds4_lightbar_valid=false;
+    host_slots[bb_slot_current()].ds4_low_battery=false;
+    host_slots[bb_slot_current()].ds4_blink_sent=false;
+    host_slots[bb_slot_current()].ds4_lightbar_retry_at=0;
     arcade_battery_poll_at = 0;
     identity_query_pending = false;
     connected_name_request = false;
@@ -2324,6 +2360,7 @@ static void service_slot(void) {
         else if (classic_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(classic_handle);
     }
     service_rumble();
+    service_ds4_lightbar(now);
 }
 static void usb_watch_handler(btstack_timer_source_t* timer) {
     uint8_t previous = bb_slot_current();
