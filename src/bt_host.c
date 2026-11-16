@@ -204,6 +204,7 @@ typedef struct {
     bd_addr_t addr;
     uint8_t page_scan_repetition_mode;
     uint16_t clock_offset;
+    bool controller_peripheral;
 } bb_classic_name_candidate_t;
 static bb_classic_name_candidate_t classic_name_candidates[BB_CLASSIC_NAME_CANDIDATES];
 static uint8_t classic_name_candidate_count;
@@ -1143,7 +1144,7 @@ static void reset_classic_name_candidates(void) {
     classic_name_request_active = false;
 }
 
-static void queue_classic_name_candidate(const uint8_t addr[6], uint8_t page_scan_repetition_mode, uint16_t clock_offset) {
+static void queue_classic_name_candidate(const uint8_t addr[6], uint8_t page_scan_repetition_mode, uint16_t clock_offset, bool controller_peripheral) {
     for (uint8_t i = 0; i < classic_name_candidate_count; ++i) {
         if (same_address(classic_name_candidates[i].addr, addr)) return;
     }
@@ -1152,6 +1153,7 @@ static void queue_classic_name_candidate(const uint8_t addr[6], uint8_t page_sca
     memcpy(candidate->addr, addr, 6);
     candidate->page_scan_repetition_mode = page_scan_repetition_mode;
     candidate->clock_offset = clock_offset;
+    candidate->controller_peripheral = controller_peripheral;
 }
 
 static void request_next_classic_name(void) {
@@ -2320,10 +2322,11 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             bool keyboard_or_pointing = peripheral && (cod & 0xc0u);
             bool controller_peripheral = peripheral && !keyboard_or_pointing && (minor == 0x00u || minor == 0x04u || minor == 0x08u);
             bool remembered = remembered_address(addr);
-            if (pairing && (remembered || controller_peripheral || likely_controller_name(name))) {
+            if (pairing && !remembered && !name[0]) {
+                // Resolve the name before authentication so legacy Wii U Pro pairing can select its PIN.
+                queue_classic_name_candidate(addr, gap_event_inquiry_result_get_page_scan_repetition_mode(packet), gap_event_inquiry_result_get_clock_offset(packet), controller_peripheral);
+            } else if (pairing && (remembered || controller_peripheral || likely_controller_name(name))) {
                 if (accept_candidate(addr, name, controller_peripheral || remembered)) connect_classic(addr, name);
-            } else if (pairing && !name[0]) {
-                queue_classic_name_candidate(addr, gap_event_inquiry_result_get_page_scan_repetition_mode(packet), gap_event_inquiry_result_get_clock_offset(packet));
             }
             break;
         }
@@ -2350,6 +2353,7 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             if (!classic_name_request_active) break;
             bd_addr_t addr;
             reverse_bd_addr(&packet[3], addr);
+            if (!same_address(addr, classic_name_candidates[classic_name_candidate_index].addr)) break;
             char name[32] = {0};
             if (packet[2] == ERROR_CODE_SUCCESS) {
                 size_t n = 0;
@@ -2359,7 +2363,8 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
                 name[n] = 0;
             }
             classic_name_request_active = false;
-            if (packet[2] == ERROR_CODE_SUCCESS && likely_controller_name(name) && accept_candidate(addr, name, false)) {
+            bool controller_peripheral = classic_name_candidates[classic_name_candidate_index].controller_peripheral;
+            if ((controller_peripheral || likely_controller_name(name)) && accept_candidate(addr, name, controller_peripheral)) {
                 connect_classic(addr, name);
                 break;
             }
@@ -2435,8 +2440,22 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
         case HCI_EVENT_PIN_CODE_REQUEST: {
             bd_addr_t addr;
             hci_event_pin_code_request_get_bd_addr(packet, addr);
-            if (pairing || remembered_address(addr)) gap_pin_code_response(addr, "0000");
-            else gap_pin_code_negative(addr);
+            if (!pairing && !remembered_address(addr)) {
+                gap_pin_code_negative(addr);
+                break;
+            }
+            const char* known_name = remembered_name(addr);
+            bool wiiu_pro = (same_address(addr, pending_addr) && name_has(pending_name, "rvl-cnt-01-uc")) ||
+                            name_has(known_name, "rvl-cnt-01-uc");
+            if (wiiu_pro) {
+                // SYNC-button pairing uses the host address as a six-byte binary PIN.
+                bd_addr_t local_addr, pin;
+                gap_local_bd_addr(local_addr);
+                reverse_bd_addr(local_addr, pin);
+                gap_pin_code_response_binary(addr, pin, sizeof(pin));
+            } else {
+                gap_pin_code_response(addr, "0000");
+            }
             break;
         }
         case HCI_EVENT_DISCONNECTION_COMPLETE: {
