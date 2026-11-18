@@ -316,6 +316,15 @@ static void handle_command(char* text) {
         send_ok(id,"saved");return;
     }
 
+    if(!strcmp(cmd,"DS4_MOUSE_GET")) {
+        if(cursor){send_err(id,"ds4_mouse");return;}
+        send_ok(id,bb_ds4_right_click_get()?"{\"right_click\":true}":"{\"right_click\":false}");return;
+    }
+    if(!strcmp(cmd,"DS4_MOUSE_SET")) {
+        char* value=next_field(&cursor);
+        if(!value||cursor||(strcmp(value,"0")&&strcmp(value,"1"))){send_err(id,"ds4_mouse");return;}
+        bb_ds4_right_click_set(value[0]=='1');send_ok(id,"saved");return;
+    }
     if(!strcmp(cmd,"DS4_AIM_GET")) {
         bb_ds4_aim_t a=bb_ds4_aim_get(),active=bb_ds4_aim_current();
         char out[256];snprintf(out,sizeof(out),"{\"enabled\":%u,\"sensitivity\":%u,\"activation\":%u,\"flags\":%u,\"pause_button\":%u,\"restart_required\":%s}",
@@ -356,7 +365,7 @@ static void handle_command(char* text) {
         pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
         char bt_address[18];
         bb_bt_host_local_address(bt_address, sizeof(bt_address));
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true,\"touch_mouse\":true,\"ds4_gyro\":true,\"ds4_lightbar\":true,\"bluetooth_address\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\",\"bt_address\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name, bt_address);
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true,\"touch_mouse\":true,\"ds4_gyro\":true,\"ds4_lightbar\":true,\"ds4_right_click\":true,\"bluetooth_address\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\",\"bt_address\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name, bt_address);
         send_ok(id, out);
         return;
     }
@@ -681,7 +690,7 @@ static void handle_command(char* text) {
         char* size = next_field(&cursor);
         char* checksum = next_field(&cursor);
         int schema_value = schema ? atoi(schema) : 0;
-        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value == 12 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V12_SIZE) || (schema_value == 13 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V13_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 13 && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11 && schema_value != 12))) {
+        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value == 12 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V12_SIZE) || (schema_value == 14 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V14_SIZE) || (schema_value == 13 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V13_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 14 && schema_value != 13 && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11 && schema_value != 12))) {
             import_active = false;
             send_err(id, "config_header");
             return;
