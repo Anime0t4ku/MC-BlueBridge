@@ -46,4 +46,12 @@ static inline bb_rgb_t bb_lightbar_resolve(const bb_lightbar_config_t* c,unsigne
 static inline bool bb_ds4_low_battery_blink(bool previous,bool supported,uint8_t percent,uint8_t state) {
     return supported && state==1 && percent<(previous?25u:20u);
 }
-void bb_ds4_output_build(uint8_t report[78],uint8_t strength,bb_rgb_t colour,bool low_battery,bool update_blink);
+typedef struct { uint8_t big,small; } bb_ds4_motors_t;
+/* Zero-valued separate motors mean unknown for a nonzero merged effect.
+ * Explicit stop always wins, including when the last effect had both motors. */
+static inline bb_ds4_motors_t bb_ds4_rumble_motors(uint8_t strength,uint8_t big,uint8_t small,bool stop) {
+    if(stop)return (bb_ds4_motors_t){0};
+    if(big||small)return (bb_ds4_motors_t){big,small};
+    return (bb_ds4_motors_t){strength,strength};
+}
+void bb_ds4_output_build(uint8_t report[78],uint8_t big,uint8_t small,bb_rgb_t colour,bool low_battery,bool update_blink);

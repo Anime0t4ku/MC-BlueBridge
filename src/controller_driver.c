@@ -14,13 +14,13 @@ static uint32_t ds4_pointer_crc_byte(uint32_t crc,uint8_t byte) {
     return crc;
 }
 bool bb_ds4_pointer_decode(bb_ds4_pointer_t* s,const uint8_t* p,uint16_t len,
-                           uint32_t now,bb_pointer_sample_t* out) {
+                           uint32_t now,bool right_click,bb_pointer_sample_t* out) {
     if(!p||len!=78||p[0]!=0x11||p[35]>4)return false;
     uint32_t crc=ds4_pointer_crc_byte(0xffffffffu,0xa1);
     for(unsigned i=0;i<74;i++)crc=ds4_pointer_crc_byte(crc,p[i]);
     uint32_t received=(uint32_t)p[74]|((uint32_t)p[75]<<8)|((uint32_t)p[76]<<16)|((uint32_t)p[77]<<24);
     if((~crc)!=received)return false;
-    *out=(bb_pointer_sample_t){.buttons=(p[9]&2u)?1:0};
+    *out=(bb_pointer_sample_t){0};
     if((uint32_t)(now-s->at)>500u)memset(s,0,sizeof(*s));
     s->at=now;
     for(unsigned i=0;i<p[35];i++) {
@@ -44,6 +44,13 @@ bool bb_ds4_pointer_decode(bb_ds4_pointer_t* s,const uint8_t* p,uint16_t len,
         } else s->remainder_x=s->remainder_y=0;
         s->touching=true;s->contact=id;s->x=x;s->y=y;
     }
+    /* Choose once at physical press, after processing fresh touch history.
+     * No active contact falls back to left-click. Keep the choice through a
+     * drag, finger lift or side crossing until the physical button is up. */
+    if(p[9]&2u) {
+        if(!s->click_button)s->click_button=right_click&&s->touching&&s->x>=960?2u:1u;
+        out->buttons=s->click_button;
+    } else s->click_button=0;
     return true;
 }
 
@@ -59,7 +66,7 @@ void bb_ds4_gyro_apply(bb_ds4_gyro_t* s,const uint8_t* p,uint32_t now,
     if(!aim.enabled||!bb_ds4_aim_valid(aim)){memset(s,0,sizeof(*s));return;}
     bool paused=aim.pause_button<32 && (input->buttons&(1u<<aim.pause_button));
     if(aim.pause_button<32)input->buttons&=~(1u<<aim.pause_button);
-    if(paused && aim.pause_button==13)pointer->buttons&=~1u;
+    if(paused && aim.pause_button==13)pointer->buttons&=~3u;
     bool active=!paused && (aim.activation==0 || (aim.activation==1&&touching) ||
         (aim.activation==2&&(input->lt>=128 || (input->buttons&(1u<<6)))));
     if(aim.flags&BB_AIM_TRIGGER_FIRE) {
@@ -1094,7 +1101,7 @@ static bool parse_ds4_common(const uint8_t* p, uint16_t len, uint8_t base, bool 
     if(bb_usb_touch_mouse_enabled()) {
         bb_pointer_sample_t pointer;
         if(bb_ds4_pointer_decode(&driver_slots[bb_slot_current()].pointer,p,len,
-            to_ms_since_boot(get_absolute_time()),&pointer)) {
+            to_ms_since_boot(get_absolute_time()),bb_ds4_right_click_current(),&pointer)) {
             bb_ds4_gyro_apply(&driver_slots[bb_slot_current()].ds4_gyro,p,
                 to_ms_since_boot(get_absolute_time()),bb_ds4_aim_current(),
                 driver_slots[bb_slot_current()].pointer.touching,&s,&pointer);
