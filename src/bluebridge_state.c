@@ -1,5 +1,6 @@
 #include "bluebridge_state.h"
 #include "config_store.h"
+#include "usb_device.h"
 #include "pico/critical_section.h"
 #include "pico/platform.h"
 #include <stdio.h>
@@ -9,6 +10,9 @@ static critical_section_t lock;
 static bb_runtime_state_t runtime_slots[BB_MAX_SLOTS];
 static uint8_t io_slot;
 static bool boot_multi;
+static volatile uint8_t live_output_mode;
+static volatile uint8_t output_slot;
+static bool recovery_output;
 static bool boot_touch_mouse;
 static volatile bool live_ds4_right_click;
 static bb_ds4_aim_t boot_ds4_aim;
@@ -95,7 +99,44 @@ void bb_touch_mouse_set(bool enabled){
     if(enabled!=boot_touch_mouse)mode_restart=true;
     critical_section_exit(&lock);
 }
-bool bb_multi_mode(void) { return boot_multi; }
+bool bb_multi_mode(void) { return boot_multi && live_output_mode == BB_OUTPUT_MISTER; }
+bool bb_multi_transport_mode(void) { return boot_multi; }
+uint8_t bb_output_slot(void) { return output_slot; }
+uint8_t bb_output_default(void) {
+    critical_section_enter_blocking(&lock);
+    uint8_t mode = config_state.output_mode;
+    critical_section_exit(&lock);
+    return mode;
+}
+bool bb_controller_output_get(uint8_t index, uint32_t* id, uint8_t* mode) {
+    critical_section_enter_blocking(&lock);
+    bool ok = index < config_state.controller_count;
+    if (ok) {
+        if (id) *id = config_state.controllers[index].id;
+        if (mode) *mode = config_state.controller_output_overrides[index];
+    }
+    critical_section_exit(&lock);
+    return ok;
+}
+bool bb_controller_output_set(uint8_t index, uint32_t id, uint8_t mode) {
+    if (mode > BB_OUTPUT_LAST) return false;
+    critical_section_enter_blocking(&lock);
+    bool ok = index < config_state.controller_count && config_state.controllers[index].id == id;
+    if (ok && config_state.controller_output_overrides[index] != mode) {
+        config_state.controller_output_overrides[index] = mode;
+        config_save_pending = true;
+    }
+    critical_section_exit(&lock);
+    // Apply on the next connection, so editing a preference cannot strand management.
+    return ok;
+}
+void bb_output_recover(void) {
+    critical_section_enter_blocking(&lock);
+    live_output_mode = BB_OUTPUT_MISTER;
+    recovery_output = true;
+    critical_section_exit(&lock);
+    bb_usb_request_reenumeration();
+}
 bool bb_mode_restart_pending(void) { return mode_restart; }
 void bb_slot_enter(uint8_t slot) { if (slot < BB_MAX_SLOTS) io_slot = slot; }
 uint8_t bb_slot_current(void) {
@@ -219,13 +260,14 @@ void bb_state_init(void) {
     }
     if (!bb_config_load(&config_state)) {
         init_defaults(&config_state);
-    } else if (config_state.schema >= 8 && config_state.schema <= 14) {
+    } else if (config_state.schema >= 8 && config_state.schema <= 15) {
         if(config_state.schema<14){
             config_state.touch_mouse_enabled=0;
             config_state.ds4_aim=bb_ds4_aim_defaults();
             config_state.lightbar=bb_lightbar_defaults();
         }
-        config_state.ds4_right_click=0;
+        if(config_state.schema<15)config_state.ds4_right_click=0;
+        memset(config_state.controller_output_overrides,0,sizeof(config_state.controller_output_overrides));
         config_state.schema = BB_CONFIG_SCHEMA;
         if (config_state.output_mode < BB_OUTPUT_MISTER || config_state.output_mode > BB_OUTPUT_LAST) config_state.output_mode = BB_OUTPUT_MISTER;
         config_save_pending = true;
@@ -239,17 +281,33 @@ void bb_state_init(void) {
     if(!bb_ds4_aim_valid(config_state.ds4_aim)){config_state.ds4_aim=bb_ds4_aim_defaults();config_save_pending=true;}
     if(!bb_lightbar_valid(&config_state.lightbar)){config_state.lightbar=bb_lightbar_defaults();config_save_pending=true;}
     if(config_state.ds4_right_click>1){config_state.ds4_right_click=0;config_save_pending=true;}
+    for (unsigned i=0;i<BB_MAX_CONTROLLERS;++i) {
+        if(config_state.controller_output_overrides[i]>BB_OUTPUT_LAST) {
+            config_state.controller_output_overrides[i]=0;config_save_pending=true;
+        }
+    }
     live_ds4_right_click=config_state.ds4_right_click!=0;
     boot_touch_mouse=config_state.touch_mouse_enabled==1;
     boot_ds4_aim=config_state.ds4_aim;
     boot_multi = config_state.multi_controller == 1;
     config_state.multi_controller = boot_multi;
     if (boot_multi) config_state.output_mode = BB_OUTPUT_MISTER;
+    live_output_mode = config_state.output_mode;
+    output_slot = 0;
 }
 
-void bb_state_set_controller(bool connected, int idx, const char* name) {
+bool bb_state_set_controller(bool connected, int idx, const char* name) {
     critical_section_enter_blocking(&lock);
     int previous_index = runtime_state.controller_index;
+    bool fresh = connected && (!runtime_state.controller_connected || previous_index != idx);
+    uint8_t old_mode = live_output_mode, old_owner = output_slot;
+    if (fresh) recovery_output = false;
+    if (fresh && idx >= 0 && idx < config_state.controller_count) {
+        uint8_t mode = config_state.controller_output_overrides[idx];
+        live_output_mode = mode ? mode : config_state.output_mode;
+        output_slot = bb_slot_current();
+    }
+    if (!connected && !recovery_output && output_slot == bb_slot_current()) live_output_mode = config_state.output_mode;
     runtime_state.controller_connected = connected;
     runtime_state.controller_index = connected ? idx : -1;
     snprintf(runtime_state.controller_name, sizeof(runtime_state.controller_name), "%s", name ? name : (connected ? "Bluetooth Controller" : ""));
@@ -283,7 +341,10 @@ void bb_state_set_controller(bool connected, int idx, const char* name) {
             }
         }
     }
+    bool changed = old_mode != live_output_mode || (!bb_multi_mode() && old_owner != output_slot);
     critical_section_exit(&lock);
+    if (changed) bb_usb_request_reenumeration();
+    return fresh;
 }
 
 void bb_state_set_scanning(bool scanning) {
@@ -498,7 +559,7 @@ uint8_t bb_active_profile_index(void) {
 uint8_t bb_output_mode_value(void) {
     uint8_t mode;
     critical_section_enter_blocking(&lock);
-    mode = config_state.output_mode;
+    mode = live_output_mode;
     critical_section_exit(&lock);
     return mode;
 }
@@ -506,6 +567,8 @@ uint8_t bb_output_mode_value(void) {
 void bb_config_set(const bb_config_t* cfg, bool persist) {
     critical_section_enter_blocking(&lock);
     config_state = *cfg;
+    recovery_output = false;
+    live_output_mode = config_state.output_mode;
     live_ds4_right_click=config_state.ds4_right_click==1;
     if (persist) config_save_pending = true;
     critical_section_exit(&lock);
@@ -844,11 +907,13 @@ bool bb_controller_forget(uint8_t index, uint8_t address_out[6]) {
         if (address_out) memcpy(address_out, config_state.controllers[index].bluetooth_address, 6);
         for (uint8_t i = index; i + 1 < config_state.controller_count; ++i) {
             config_state.controllers[i] = config_state.controllers[i + 1];
+            config_state.controller_output_overrides[i] = config_state.controller_output_overrides[i + 1];
             config_state.lightbar.controllers[i]=config_state.lightbar.controllers[i+1];
             memcpy(config_state.controller_names[i], config_state.controller_names[i + 1], BB_MAX_NAME);
         }
         memset(config_state.controller_names[config_state.controller_count - 1], 0, BB_MAX_NAME);
         config_state.lightbar.controllers[config_state.controller_count-1]=(bb_lightbar_choice_t){.rgb=config_state.lightbar.players[0]};
+        config_state.controller_output_overrides[config_state.controller_count-1] = 0;
         config_state.controller_count--;
         if (boot_multi) {
             for (unsigned slot = 0; slot < BB_MAX_SLOTS; ++slot) {
@@ -1010,6 +1075,7 @@ bool bb_controller_activate_or_create(const uint8_t address[6], uint16_t vendor_
     } else if (config_state.controller_count < BB_MAX_CONTROLLERS) {
         index = config_state.controller_count++;
         bb_controller_t* controller = &config_state.controllers[index];
+        config_state.controller_output_overrides[index] = 0;
         memset(controller, 0, sizeof(*controller));
         controller->id = config_state.next_controller_id++;
         memcpy(controller->bluetooth_address, address, 6);
@@ -1070,9 +1136,12 @@ bool bb_controller_select(uint8_t index) {
 }
 
 bool bb_output_mode_set(bb_output_mode_t mode) {
-    if (mode < BB_OUTPUT_MISTER || mode > BB_OUTPUT_LAST || (boot_multi && mode != BB_OUTPUT_MISTER)) return false;
+    if (mode < BB_OUTPUT_MISTER || mode > BB_OUTPUT_LAST) return false;
     critical_section_enter_blocking(&lock);
-    config_state.output_mode = (uint8_t)mode;
+    live_output_mode = (uint8_t)mode;
+    recovery_output = false;
+    // Multi-controller preference is retained; only MiSTer can expose both pads.
+    config_state.output_mode = boot_multi ? BB_OUTPUT_MISTER : (uint8_t)mode;
     config_save_pending = true;
     critical_section_exit(&lock);
     return true;
@@ -1100,7 +1169,8 @@ bb_output_mode_t bb_output_mode(void) {
 const char* bb_output_mode_name(bb_output_mode_t mode) {
     switch (mode) {
         case BB_OUTPUT_MISTER: return "MiSTer";
-        case BB_OUTPUT_XINPUT: return "X-Input";
+        case BB_OUTPUT_XINPUT: return "X-Input (BlueBridge)";
+        case BB_OUTPUT_X360: return "X-Input (X360)";
         case BB_OUTPUT_GENERIC_HID: return "Generic HID";
         case BB_OUTPUT_SWITCH: return "Nintendo Switch";
         case BB_OUTPUT_XBOX360: return "Xbox 360 (Console)";
@@ -1120,6 +1190,8 @@ bool bb_config_import(const bb_config_t* cfg, uint32_t checksum) {
     static bb_config_t value;
     value = *cfg;
     value.schema = BB_CONFIG_SCHEMA;
+    if(cfg->schema<16)memset(value.controller_output_overrides,0,sizeof(value.controller_output_overrides));
+    for(unsigned i=0;i<BB_MAX_CONTROLLERS;++i)if(value.controller_output_overrides[i]>BB_OUTPUT_LAST)return false;
     if(cfg->schema<15)value.ds4_right_click=0;
     if(value.ds4_right_click>1)return false;
     if(cfg->schema<14){value.touch_mouse_enabled=0;value.ds4_aim=bb_ds4_aim_defaults();value.lightbar=bb_lightbar_defaults();}

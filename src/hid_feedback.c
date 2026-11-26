@@ -38,8 +38,6 @@ typedef struct {
 } bb_feedback_context_t;
 static bb_feedback_context_t feedback_slots[BB_MAX_SLOTS] = {
 {.device_gain=255,.enabled=true,.load_status=3},
-{.device_gain=255,.enabled=true,.load_status=3},
-{.device_gain=255,.enabled=true,.load_status=3},
 {.device_gain=255,.enabled=true,.load_status=3}
 };
 static uint8_t feedback_slot;
@@ -99,7 +97,7 @@ static unsigned available(void) {
 
 void bb_feedback_stop(void) {
     for (unsigned i = 0; i < BB_EFFECT_COUNT; ++i) effects[i].playing = false;
-    if (last_strength) bb_bt_host_set_slot_rumble(feedback_slot, 0, 0);
+    if (last_strength) bb_bt_host_set_slot_rumble(bb_multi_mode()?feedback_slot:bb_output_slot(), 0, 0);
     last_strength = 0;
     last_left = last_right = 0;
     last_sent_at = clock_now;
@@ -112,7 +110,7 @@ void bb_feedback_reset(void) {
     paused = false;
     load_index = 0;
     load_status = 3;
-    if (last_strength) bb_bt_host_set_slot_rumble(feedback_slot, 0, 0);
+    if (last_strength) bb_bt_host_set_slot_rumble(bb_multi_mode()?feedback_slot:bb_output_slot(), 0, 0);
     last_strength = 0;
     last_left = last_right = 0;
     last_sent_at = clock_now;
@@ -263,7 +261,7 @@ void bb_feedback_poll(uint32_t now) {
     }
     bool changed = strength != last_strength || left != last_left || right != last_right;
     if (changed || (strength && (uint32_t)(now - last_sent_at) >= 250u)) {
-        bb_bt_host_set_slot_rumble_motors(feedback_slot, strength, left, right);
+        bb_bt_host_set_slot_rumble_motors(bb_multi_mode()?feedback_slot:bb_output_slot(), strength, left, right);
         last_strength = strength;
         last_left = left;
         last_right = right;

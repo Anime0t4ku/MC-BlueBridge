@@ -64,7 +64,7 @@ static bool press_latch_enabled[BB_MAX_SLOTS];
 static uint16_t press_latched_buttons[BB_MAX_SLOTS];
 static uint16_t press_previous_buttons[BB_MAX_SLOTS];
 static uint8_t usb_slot;
-static bool reenumerate;
+static volatile bool reenumerate;
 static volatile bool usb_mounted;
 static uint32_t switch_last_send;
 static uint32_t dualsense_last_send;
@@ -176,6 +176,7 @@ bool bb_usb_ready(void) {
 }
 
 void bb_usb_request_reenumeration(void) {
+    if (!usb_lock_ready) { reenumerate = true; return; }
     critical_section_enter_blocking(&usb_lock);
     reenumerate = true;
     critical_section_exit(&usb_lock);
@@ -262,13 +263,14 @@ static bool send_switch_state(const bb_gamepad_report_t* r) {
 
 static void send_pending(void) {
     bb_output_mode_t mode = bb_output_mode();
-    if ((mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_XBOX360) ? !bb_xinput_ready() : !tud_hid_n_ready(usb_slot)) return;
+    uint8_t report_slot = bb_multi_mode() ? usb_slot : bb_output_slot();
+    if ((mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_X360 || mode == BB_OUTPUT_XBOX360) ? !bb_xinput_ready() : !tud_hid_n_ready(usb_slot)) return;
     bb_gamepad_report_t report;
     uint16_t latched_for_send = 0;
     bool send = false;
     bool queued = false;
     critical_section_enter_blocking(&usb_lock);
-    bb_usb_queue_t* q = &usb_queues[usb_slot];
+    bb_usb_queue_t* q = &usb_queues[report_slot];
     if (q->count) {
         report = q->reports[q->head];
         q->head = (uint8_t)((q->head + 1u) % BB_USB_QUEUE_DEPTH);
@@ -276,25 +278,25 @@ static void send_pending(void) {
         send = true;
         queued = true;
     } else if (mode == BB_OUTPUT_XBOX360) {
-        report = latest_slots[usb_slot];
+        report = latest_slots[report_slot];
         send = true;
     } else if (mode == BB_OUTPUT_DUALSENSE && (uint32_t)(to_ms_since_boot(get_absolute_time()) - dualsense_last_send) >= 4u) {
         // A real DualSense streams input reports continuously.
-        report = latest_slots[usb_slot];
+        report = latest_slots[report_slot];
         send = true;
     } else if (mode == BB_OUTPUT_SWITCH && (uint32_t)(to_ms_since_boot(get_absolute_time()) - switch_last_send) >= 15u) {
-        report = latest_slots[usb_slot];
+        report = latest_slots[report_slot];
         send = true;
     }
-    if (send && press_latch_enabled[usb_slot]) {
-        latched_for_send = press_latched_buttons[usb_slot];
+    if (send && press_latch_enabled[report_slot]) {
+        latched_for_send = press_latched_buttons[report_slot];
         report.buttons |= latched_for_send;
-        press_latched_buttons[usb_slot] &= (uint16_t)~latched_for_send;
+        press_latched_buttons[report_slot] &= (uint16_t)~latched_for_send;
     }
     critical_section_exit(&usb_lock);
     if (!send) return;
     bool ok = false;
-    if (mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_XBOX360) ok = send_xinput(&report);
+    if (mode == BB_OUTPUT_XINPUT || mode == BB_OUTPUT_X360 || mode == BB_OUTPUT_XBOX360) ok = send_xinput(&report);
     else if (mode == BB_OUTPUT_DUALSENSE) {
         uint8_t body[BB_DS5_INPUT_SIZE];
         bb_ds5_build_input(&report, body);
@@ -325,15 +327,15 @@ static void send_pending(void) {
         gamepad.buttons = report.buttons;
         ok = tud_hid_n_report(usb_slot, REPORT_ID_GAMEPAD, &gamepad, sizeof(gamepad));
     }
-    bb_state_note_slot_usb_report(usb_slot, ok);
+    bb_state_note_slot_usb_report(report_slot, ok);
     if (!ok && latched_for_send) {
         critical_section_enter_blocking(&usb_lock);
-        press_latched_buttons[usb_slot] |= latched_for_send;
+        press_latched_buttons[report_slot] |= latched_for_send;
         critical_section_exit(&usb_lock);
     }
     if (!ok && queued) {
         critical_section_enter_blocking(&usb_lock);
-        q = &usb_queues[usb_slot];
+        q = &usb_queues[report_slot];
         if (q->count < BB_USB_QUEUE_DEPTH) {
             q->head = (uint8_t)((q->head + BB_USB_QUEUE_DEPTH - 1u) % BB_USB_QUEUE_DEPTH);
             q->reports[q->head] = report;
@@ -344,13 +346,15 @@ static void send_pending(void) {
 }
 
 void bb_usb_service_pending(void) {
+    // Do not transmit the new protocol through endpoints from the old layout.
+    if (reenumerate) return;
     for (usb_slot = 0; usb_slot < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++usb_slot) send_pending();
     usb_slot = 0;
     service_touch_mouse();
 }
 
 static void feedback_reset_all(void) {
-    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    for (uint8_t i = 0; i < BB_MAX_SLOTS; ++i) {
         bb_feedback_select(i);
         bb_feedback_reset();
     }
@@ -374,6 +378,14 @@ static void handle_reenumeration(void) {
     sleep_ms(120);
     switch_last_send = 0;
     dualsense_last_send = 0;
+    critical_section_enter_blocking(&usb_lock);
+    for(uint8_t i=0;i<BB_MAX_SLOTS;++i) {
+        usb_queues[i].head=0;usb_queues[i].count=1;
+        usb_queues[i].reports[0]=latest_slots[i];
+        press_latched_buttons[i]=0;
+        press_previous_buttons[i]=latest_slots[i].buttons;
+    }
+    critical_section_exit(&usb_lock);
     bb_ds5_reset();
     if (bb_output_mode() == BB_OUTPUT_XBOX360) bb_xbox360_auth_init();
     tud_connect();
@@ -475,7 +487,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         0,1,'X','U','S','B','1','0',0,0,0,0,0,0,0,0,
         0,0,0,0,0,0,0,0
     };
-    if (bb_output_mode() != BB_OUTPUT_XINPUT || request->bmRequestType != 0xc0 ||
+    bb_output_mode_t mode = bb_output_mode();
+    if ((mode != BB_OUTPUT_XINPUT && mode != BB_OUTPUT_X360) || request->bmRequestType != 0xc0 ||
         request->bRequest != 0x20 || request->wIndex != 4 || request->wValue != 0) return false;
     if (stage != CONTROL_STAGE_SETUP) return true;
     return tud_control_xfer(rhport, request, (void*)compatible_id, sizeof(compatible_id));

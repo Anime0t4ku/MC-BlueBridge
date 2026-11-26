@@ -2,6 +2,7 @@
 #include "bluebridge_platform.h"
 #include "bluebridge_state.h"
 #include "usb_device.h"
+#include "bt_host.h"
 #include "hardware/gpio.h"
 #include "hardware/structs/ioqspi.h"
 #include "hardware/structs/sio.h"
@@ -60,10 +61,9 @@ void bb_bootsel_poll(uint32_t now) {
         if (state.pairing) bb_platform_stop_pairing();
         else bb_platform_start_pairing();
     }
-    if (!recovery_action && held >= 5000u &&
-        (bb_output_mode() == BB_OUTPUT_XBOX360 || bb_output_mode() == BB_OUTPUT_DUALSENSE)) {
+    if (!recovery_action && held >= 5000u) {
         recovery_action = true;
         bb_platform_stop_pairing();
-        if (bb_output_mode_set(BB_OUTPUT_MISTER)) bb_usb_request_reenumeration();
+        bb_bt_host_recover_output();
     }
 }

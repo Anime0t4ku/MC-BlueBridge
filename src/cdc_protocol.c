@@ -65,6 +65,27 @@ static void send_err(const char* id, const char* payload) {
     send_result(id, "ERR", payload);
 }
 
+static bool parse_unsigned(const char* text, uint32_t maximum, uint32_t* out) {
+    if (!text || !*text) return false;
+    uint32_t value=0;
+    for (const char* p=text; *p; ++p) {
+        if (*p<'0'||*p>'9') return false;
+        uint32_t digit=(uint32_t)(*p-'0');
+        if (digit>maximum || value>(maximum-digit)/10u) return false;
+        value=value*10u+digit;
+    }
+    *out=value;return true;
+}
+
+static void send_controller_output(const char* id, uint8_t index) {
+    uint32_t controller_id;uint8_t mode;
+    if(!bb_controller_output_get(index,&controller_id,&mode)){send_err(id,"controller_index");return;}
+    char out[192];
+    snprintf(out,sizeof(out),"{\"index\":%u,\"id\":%lu,\"mode\":%u,\"name\":\"%s\",\"apply_on_reconnect\":true}",
+        index,(unsigned long)controller_id,mode,mode?bb_output_mode_name((bb_output_mode_t)mode):"Default");
+    send_ok(id,out);
+}
+
 static void send_status(const char* id) {
     bb_runtime_state_t state;
     bb_profile_t profile;
@@ -75,11 +96,11 @@ static void send_status(const char* id) {
     uint8_t output_mode = bb_output_mode_value();
     char bt_address[18];
     bb_bt_host_local_address(bt_address, sizeof(bt_address));
-    char out[1024];
+    char out[1536];
     snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"bt_ready\":%s,\"usb_ready\":%s,\"controller_connected\":%s,\"pairing\":%s,\"controller\":\"%s\",\"controller_index\":%d,\"active_profile\":%u,\"profile\":\"%s\",\"output_mode\":%u,\"output\":\"%s\",\"bt_reports\":%lu,\"usb_reports\":%lu,\"dropped_usb_reports\":%lu,\"raw_buttons\":%lu,\"button_capabilities\":%lu,\"battery_supported\":%s,\"battery_percent\":%u,\"battery_state\":%u,\"rumble_supported\":%s,\"capture_mode\":%u,\"xbox360_authenticated\":%s,\"bt_address\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, state.bt_ready ? "true" : "false", state.usb_ready ? "true" : "false", state.controller_connected ? "true" : "false", state.pairing ? "true" : "false", state.controller_name, state.controller_index, active_profile, profile.name, output_mode, bb_output_mode_name((bb_output_mode_t)output_mode), (unsigned long)state.bt_reports, (unsigned long)state.usb_reports, (unsigned long)state.dropped_usb_reports, (unsigned long)state.raw_buttons, (unsigned long)state.button_capabilities, state.battery_supported ? "true" : "false", state.battery_percent, state.battery_state, state.rumble_supported ? "true" : "false", state.capture_mode, bb_xbox360_authenticated() ? "true" : "false", bt_address);
     size_t pos = strlen(out);
     if (pos && out[pos - 1] == '}') {
-        snprintf(out + pos - 1, sizeof(out) - pos + 1, ",\"multi_controller\":%s,\"max_connected\":%u,\"slot\":%u,\"turbo_available\":%s,\"macros_available\":%s}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_slot_current(), bb_multi_mode() ? "false" : "true", bb_multi_mode() ? "false" : "true");
+        snprintf(out + pos - 1, sizeof(out) - pos + 1, ",\"multi_controller\":%s,\"max_connected\":%u,\"slot\":%u,\"turbo_available\":%s,\"macros_available\":%s,\"multi_controller_enabled\":%s,\"default_output_mode\":%u,\"output_slot\":%u}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_slot_current(), bb_multi_mode() ? "false" : "true", bb_multi_mode() ? "false" : "true", bb_multi_transport_mode()?"true":"false", bb_output_default(), bb_output_slot());
     }
     send_ok(id, out);
 }
@@ -144,7 +165,7 @@ static void send_controllers(const char* id) {
         bb_controller_kind_t kind = bb_controller_identify(c->native_vendor_id, c->native_product_id, c->name);
         char bluetooth_id[18];
         format_address(c->bluetooth_address, bluetooth_id);
-        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"bluetooth_id\":\"%s\",\"name\":\"%s\",\"model_name\":\"%s\",\"custom_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s,\"slot\":%d}", i ? "," : "", i, (unsigned long)c->id, bluetooth_id, display, c->name, cfg.controller_names[i], (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, bb_controller_slot(i) >= 0 ? "true" : "false", bb_controller_slot(i));
+        pos += (size_t)snprintf(out + pos, sizeof(out) - pos, "%s{\"index\":%u,\"id\":%lu,\"bluetooth_id\":\"%s\",\"name\":\"%s\",\"model_name\":\"%s\",\"custom_name\":\"%s\",\"kind\":%u,\"kind_name\":\"%s\",\"native_vid\":%u,\"native_pid\":%u,\"profiles\":%u,\"active_profile\":%u,\"connected\":%s,\"slot\":%d,\"output_override\":%u}", i ? "," : "", i, (unsigned long)c->id, bluetooth_id, display, c->name, cfg.controller_names[i], (unsigned)kind, bb_controller_kind_name(kind), c->native_vendor_id, c->native_product_id, c->profile_count, c->active_profile, bb_controller_slot(i) >= 0 ? "true" : "false", bb_controller_slot(i), cfg.controller_output_overrides[i]);
     }
     snprintf(out + pos, sizeof(out) - pos, "]}");
     send_ok(id, out);
@@ -358,14 +379,14 @@ static void handle_command(char* text) {
         send_ok(id,out);return;
     }
     if (!strcmp(cmd, "HELLO")) {
-        char out[768], adapter_name[BB_MAX_NAME], custom_name[BB_MAX_NAME];
+        char out[1024], adapter_name[BB_MAX_NAME], custom_name[BB_MAX_NAME];
         char adapter_id[2 * PICO_UNIQUE_BOARD_ID_SIZE_BYTES + 1];
         bb_adapter_name_get(adapter_name, sizeof(adapter_name));
         bb_adapter_custom_name_get(custom_name, sizeof(custom_name));
         pico_get_unique_board_id_string(adapter_id, sizeof(adapter_id));
         char bt_address[18];
         bb_bt_host_local_address(bt_address, sizeof(bt_address));
-        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true,\"touch_mouse\":true,\"ds4_gyro\":true,\"ds4_lightbar\":true,\"ds4_right_click\":true,\"bluetooth_address\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\",\"bt_address\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name, bt_address);
+        snprintf(out, sizeof(out), "{\"protocol\":%d,\"firmware\":\"%s\",\"hardware\":\"Pico 2 W\",\"config_schema\":%d,\"capabilities\":{\"controller_rename\":true,\"remapped_tester\":true,\"adapter_rename\":true,\"multi_controller_mode\":true,\"multi_controller_diagnostics\":true,\"device_blacklist\":true,\"bluetooth_device_id\":true,\"touch_mouse\":true,\"ds4_gyro\":true,\"ds4_lightbar\":true,\"ds4_right_click\":true,\"bluetooth_address\":true,\"controller_output_override\":true,\"native_xinput_modes\":true,\"output_modes\":true,\"bootsel_output_recovery\":true},\"firmware_id\":\"%s\",\"adapter_id\":\"%s\",\"adapter_name\":\"%s\",\"adapter_custom_name\":\"%s\",\"bt_address\":\"%s\"}", BLUEBRIDGE_PROTOCOL_VERSION, BLUEBRIDGE_VERSION, BB_CONFIG_SCHEMA, BLUEBRIDGE_FIRMWARE_MANIFEST, adapter_id, adapter_name, custom_name, bt_address);
         send_ok(id, out);
         return;
     }
@@ -385,7 +406,7 @@ static void handle_command(char* text) {
         char* value = next_field(&cursor);
         char* end = NULL;
         long slot = value ? strtol(value, &end, 10) : -1;
-        if (value && (!value[0] || *end || slot < 0 || slot >= (bb_multi_mode() ? BB_MAX_SLOTS : 1))) { send_err(id, "slot"); return; }
+        if (value && (!value[0] || *end || slot < 0 || slot >= (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1))) { send_err(id, "slot"); return; }
         if (value ? bb_bt_host_diagnostics_slot((uint8_t)slot, out, sizeof(out)) : bb_bt_host_diagnostics(out, sizeof(out))) send_ok(id, out);
         else send_err(id, "bt_diagnostics");
         return;
@@ -400,7 +421,7 @@ static void handle_command(char* text) {
     }
     if (!strcmp(cmd, "MODE_GET")) {
         char out[192];
-        snprintf(out, sizeof(out), "{\"multi_controller\":%s,\"max_connected\":%u,\"mister_only\":%s}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_multi_mode() ? "true" : "false");
+        snprintf(out, sizeof(out), "{\"multi_controller\":%s,\"max_connected\":%u,\"mister_only\":%s,\"multi_controller_enabled\":%s}", bb_multi_mode() ? "true" : "false", bb_multi_mode() ? BB_MAX_SLOTS : 1, bb_multi_mode() ? "true" : "false", bb_multi_transport_mode()?"true":"false");
         send_ok(id, out);
         return;
     }
@@ -664,6 +685,26 @@ static void handle_command(char* text) {
         }
         return;
     }
+    if (!strcmp(cmd, "CONTROLLER_OUTPUT_GET") || !strcmp(cmd,"CONTROLLER_OUTPUT_SET")) {
+        uint32_t index, controller_id, mode;
+        if(!parse_unsigned(next_field(&cursor),BB_MAX_CONTROLLERS-1,&index)) {send_err(id,"controller_index");return;}
+        if(!strcmp(cmd,"CONTROLLER_OUTPUT_SET")) {
+            if(!parse_unsigned(next_field(&cursor),UINT32_MAX,&controller_id) ||
+               !parse_unsigned(next_field(&cursor),BB_OUTPUT_LAST,&mode) || cursor ||
+               !bb_controller_output_set((uint8_t)index,controller_id,(uint8_t)mode)) {send_err(id,"controller_output");return;}
+        } else if(cursor) {send_err(id,"controller_output");return;}
+        send_controller_output(id,(uint8_t)index);return;
+    }
+    if (!strcmp(cmd,"OUTPUT_MODES")) {
+        char out[1536];
+        size_t pos=(size_t)snprintf(out,sizeof(out),"{\"modes\":[");
+        for(uint8_t mode=BB_OUTPUT_MISTER;mode<=BB_OUTPUT_LAST;++mode) {
+            bool limited=mode==BB_OUTPUT_X360||mode==BB_OUTPUT_XBOX360;
+            pos+=(size_t)snprintf(out+pos,sizeof(out)-pos,"%s{\"mode\":%u,\"name\":\"%s\",\"usb_management_may_be_unavailable\":%s}",
+                mode>BB_OUTPUT_MISTER?",":"",mode,bb_output_mode_name((bb_output_mode_t)mode),limited?"true":"false");
+        }
+        snprintf(out+pos,sizeof(out)-pos,"],\"override_default\":0,\"recovery_hold_ms\":5000}");send_ok(id,out);return;
+    }
     if (!strcmp(cmd, "OUTPUT_GET")) {
         char out[96];
         bb_output_mode_t mode = bb_output_mode();
@@ -674,7 +715,8 @@ static void handle_command(char* text) {
     if (!strcmp(cmd, "OUTPUT_SET")) {
         char* a = next_field(&cursor);
         bb_output_mode_t old_mode = bb_output_mode();
-        if (!a || !bb_output_mode_set((bb_output_mode_t)atoi(a))) send_err(id, "output_mode");
+        uint32_t mode;
+        if (!parse_unsigned(a,BB_OUTPUT_LAST,&mode) || cursor || !bb_output_mode_set((bb_output_mode_t)mode)) send_err(id, "output_mode");
         else {
             if (old_mode != bb_output_mode()) bb_usb_request_reenumeration();
             send_ok(id, "updated");
@@ -690,7 +732,7 @@ static void handle_command(char* text) {
         char* size = next_field(&cursor);
         char* checksum = next_field(&cursor);
         int schema_value = schema ? atoi(schema) : 0;
-        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value == 12 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V12_SIZE) || (schema_value == 14 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V14_SIZE) || (schema_value == 13 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V13_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 14 && schema_value != 13 && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11 && schema_value != 12))) {
+        if (!schema || !size || !checksum || ((schema_value == BB_CONFIG_SCHEMA && (size_t)strtoul(size, NULL, 10) != sizeof(bb_config_t)) || ((schema_value == 8 || schema_value == 9) && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_LEGACY_SIZE) || (schema_value == 10 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V10_SIZE) || (schema_value == 11 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V11_SIZE) || (schema_value == 12 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V12_SIZE) || (schema_value == 15 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V15_SIZE) || (schema_value == 14 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V14_SIZE) || (schema_value == 13 && (size_t)strtoul(size, NULL, 10) != BB_CONFIG_V13_SIZE) || (schema_value != BB_CONFIG_SCHEMA && schema_value != 15 && schema_value != 14 && schema_value != 13 && schema_value != 8 && schema_value != 9 && schema_value != 10 && schema_value != 11 && schema_value != 12))) {
             import_active = false;
             send_err(id, "config_header");
             return;

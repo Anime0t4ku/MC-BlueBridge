@@ -74,6 +74,9 @@ void bb_input_submit(const bb_input_state_t* state) {
     static uint8_t last_turbo_button;
     static uint8_t last_turbo_modifier;
     bb_state_update_live_input(state->x, state->y, state->rx, state->ry, state->lt, state->rt, state->dpad, state->buttons);
+    // A manual USB change can leave both Bluetooth links connected. Only the
+    // output owner may update the single-controller turbo/macro state.
+    if (!bb_multi_mode() && bb_slot_current()!=bb_output_slot()) return;
     bool suppress_output = bb_capture_process(state->buttons);
     if (suppress_output && !bb_capture_is_tester()) {
         previous_inputs = state->buttons;

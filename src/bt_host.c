@@ -244,7 +244,7 @@ static int slot_for_address(const uint8_t addr[6]) {
     return slot_for_address_except(addr, -1);
 }
 static bool any_setup(void) {
-    for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    for (int i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         if (host_slots[i].classic_connecting || host_slots[i].ble_connecting || host_slots[i].classic_setup_pending) return true;
     }
     return false;
@@ -255,8 +255,18 @@ static bool ble_setup_elsewhere(uint8_t owner) {
     }
     return false;
 }
+static volatile bool recovery_command;
+static uint32_t recovery_until;
+static bool recovery_waiting(void) {
+    return recovery_command || (recovery_until && (int32_t)(recovery_until-btstack_run_loop_get_time_ms())>0);
+}
+static volatile bool multi_disconnect_requests[BB_MAX_SLOTS];
 static int free_slot(void) {
-    for (int i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    if (recovery_waiting()) return -1;
+    if (!bb_multi_mode()) {
+        for (unsigned i=0;i<BB_MAX_SLOTS;++i) if(host_slots[i].current_controller_index>=0) return -1;
+    }
+    for (int i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_host_context_t* c = &host_slots[i];
         if (c->current_controller_index < 0 && !c->classic_connecting && !c->ble_connecting && !c->classic_hid_cid && c->classic_handle == HCI_CON_HANDLE_INVALID && c->pending_classic_handle == HCI_CON_HANDLE_INVALID && c->le_handle == HCI_CON_HANDLE_INVALID && c->closing_handle == HCI_CON_HANDLE_INVALID) return i;
     }
@@ -269,7 +279,7 @@ static bool connected_controller_present(void) {
     return false;
 }
 static bool multi_discovery_paused(uint32_t now) {
-    if (!bb_multi_mode() || pairing || !connection_settle_active) return false;
+    if (!bb_multi_transport_mode() || pairing || !connection_settle_active) return false;
     if (!connected_controller_present() || (uint32_t)(now - connection_settle_started) >= 1500u) {
         connection_settle_active = false;
         return false;
@@ -277,7 +287,7 @@ static bool multi_discovery_paused(uint32_t now) {
     return true;
 }
 static int route_hci(const uint8_t* packet, uint16_t size) {
-    if (!bb_multi_mode()) return 0;
+    if (!bb_multi_transport_mode()) return 0;
     if (size < 2) return -1;
     uint8_t event = packet[0];
     bd_addr_t addr;
@@ -337,7 +347,7 @@ bool bb_bt_host_diagnostics(char* out, size_t size) {
 }
 
 bool bb_bt_host_diagnostics_slot(uint8_t slot, char* out, size_t size) {
-    if (slot >= (bb_multi_mode() ? BB_MAX_SLOTS : 1)) return false;
+    if (slot >= (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1)) return false;
     const bb_host_context_t* context = &host_slots[slot];
     if (!out || size < 512) return false;
     char name_hex[65];
@@ -1098,6 +1108,7 @@ static bool same_address(const uint8_t a[6], const uint8_t b[6]) {
 }
 
 static bool reconnect_blocked(const uint8_t addr[6]) {
+    if (recovery_waiting()) return true;
     if (!reconnect_block_until) return false;
     uint32_t now = btstack_run_loop_get_time_ms();
     if ((int32_t)(reconnect_block_until - now) <= 0) {
@@ -1225,6 +1236,7 @@ static bool accept_ble_advertisement(const uint8_t addr[6], bd_addr_type_t type,
 }
 
 static bool controller_transport_ready(void) {
+    if (recovery_waiting()) return false;
     return bb_usb_ready() || bb_output_mode() == BB_OUTPUT_XBOX360;
 }
 
@@ -1232,7 +1244,7 @@ static bool accept_candidate(const uint8_t addr[6], const char* name, bool proto
     if (!controller_transport_ready()) return false;
     if (bb_blocked_device_contains(addr)) return false;
     if (reconnect_blocked(addr)) return false;
-    if (bb_multi_mode() && slot_for_address(addr) >= 0) return false;
+    if (bb_multi_transport_mode() && slot_for_address(addr) >= 0) return false;
     if (remembered_address(addr)) return true;
     if (!pairing) return false;
     return protocol_hint || likely_controller_name(name);
@@ -1262,7 +1274,7 @@ static void refresh_classic_identity(const char* name, uint16_t vid, uint16_t pi
 static void classic_identity_result_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void classic_identity_result(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (sdp_owner) : 0;
+    int slot = bb_multi_transport_mode() ? (sdp_owner) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     classic_identity_result_impl(packet_type, channel, packet, size);
@@ -1321,6 +1333,11 @@ static void service_classic_identity(void) {
 }
 
 static void activate_controller(const uint8_t addr[6], uint8_t address_type, uint16_t vid, uint16_t pid, const char* name) {
+    if (recovery_waiting()) {
+        if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
+        if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
+        return;
+    }
     bd_addr_t identity_addr;
     memcpy(identity_addr, addr, 6);
     if (le_handle != HCI_CON_HANDLE_INVALID) {
@@ -1360,7 +1377,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     if (vid == 0x2dc8 && pid == 0x3019) identity_name = "8BitDo 64";
     bb_controller_display_name(current_identity.kind, identity_name, current_identity.name, sizeof(current_identity.name));
     uint8_t controller_index = 0;
-    if (bb_multi_mode()) {
+    if (bb_multi_transport_mode()) {
         int slot = slot_for_address_except(identity_addr, bb_slot_current());
         if (slot >= 0) {
             if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
@@ -1393,7 +1410,14 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
         wiiu_setup_step = 1;
         wiiu_setup_at = btstack_run_loop_get_time_ms();
     }
-    bb_state_set_controller(true, controller_index, current_identity.name);
+    bool newly_connected = bb_state_set_controller(true, controller_index, current_identity.name);
+    if (newly_connected && !bb_multi_mode()) {
+        // A non-MiSTer override owns the single USB controller, including slot 1.
+        for (uint8_t i=0;i<BB_MAX_SLOTS;++i) {
+            bb_runtime_state_t peer;bb_state_get_slot(i,&peer);
+            if(i!=bb_slot_current() && peer.controller_connected) multi_disconnect_requests[i]=true;
+        }
+    }
     bb_state_set_scanning(false);
     bb_state_set_pairing(false);
     pairing = false;
@@ -1406,7 +1430,7 @@ static void activate_controller(const uint8_t addr[6], uint8_t address_type, uin
     gap_discoverable_control(1);
     scanning = false;
     last_controller_report_at = btstack_run_loop_get_time_ms();
-    if (!bb_multi_mode() && bb_output_mode() == BB_OUTPUT_MISTER && old_identity != bb_current_mister_identity()) bb_usb_request_reenumeration();
+    if (!bb_multi_transport_mode() && bb_output_mode() == BB_OUTPUT_MISTER && old_identity != bb_current_mister_identity()) bb_usb_request_reenumeration();
     if (bb_multi_mode()) {
         connection_settle_started = btstack_run_loop_get_time_ms();
         connection_settle_active = true;
@@ -1533,11 +1557,11 @@ static void start_classic_inquiry(void) {
 static void start_scans(void) {
     if (multi_discovery_paused(btstack_run_loop_get_time_ms())) return;
     if (!stack_ready || connection_in_progress() || free_slot() < 0) return;
-    bool busy = bb_multi_mode() && connected_controller_present();
+    bool busy = bb_multi_transport_mode() && connected_controller_present();
     if (scanning && scan_busy != busy) stop_scans();
     if (!scanning) {
         scanning = true;
-        if (bb_multi_mode()) {
+        if (bb_multi_transport_mode()) {
             discovery_started_at = btstack_run_loop_get_time_ms();
             discovery_window_active = true;
         }
@@ -1574,7 +1598,7 @@ static void connect_classic(const uint8_t addr[6], const char* name) {
     copy_name(pending_name, sizeof(pending_name), name);
     pending_vid = 0;
     pending_pid = 0;
-    gap_set_page_timeout(bb_multi_mode() && !pairing ? 4800u : 0x6000u);
+    gap_set_page_timeout(bb_multi_transport_mode() && !pairing ? 4800u : 0x6000u);
     uint8_t status = hid_host_connect(pending_addr, HID_PROTOCOL_MODE_REPORT, &classic_hid_cid);
     if (status != ERROR_CODE_SUCCESS) {
         classic_connecting = false;
@@ -1631,7 +1655,7 @@ static void connect_ble(const uint8_t addr[6], bd_addr_type_t addr_type, const c
 static void nintendo_gatt_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void nintendo_gatt_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     nintendo_gatt_handler_impl(packet_type, channel, packet, size);
@@ -1816,7 +1840,7 @@ static void ultimate2c_protocol_finish(void) {
 static void ultimate2c_protocol_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void ultimate2c_protocol_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 4 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     ultimate2c_protocol_handler_impl(packet_type, channel, packet, size);
@@ -1863,7 +1887,7 @@ static void ultimate2c_protocol_handler_impl(uint8_t packet_type, uint16_t chann
 static void ble_identity_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size);
 static void ble_identity_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
-    int slot = bb_multi_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 3)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 3)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     ble_identity_handler_impl(packet_type, channel, packet, size);
@@ -1917,7 +1941,7 @@ static void sm_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, u
             return;
         }
     }
-    int slot = bb_multi_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
+    int slot = bb_multi_transport_mode() ? (size >= 5 ? slot_for_handle(little_endian_read_16(packet, 2)) : -1) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
     sm_handler_impl(packet_type, channel, packet, size);
@@ -2259,10 +2283,10 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
 static void hci_handler(uint8_t packet_type, uint16_t channel, uint8_t* packet, uint16_t size) {
     uint8_t previous = bb_slot_current();
     if (packet_type == HCI_EVENT_PACKET && size >= 2 && packet[0] == GAP_EVENT_INQUIRY_COMPLETE) classic_inquiry_active = false;
-    int slot = bb_multi_mode() ? (route_hci(packet, size)) : 0;
+    int slot = bb_multi_transport_mode() ? (route_hci(packet, size)) : 0;
     if (slot < 0) return;
     bb_slot_enter((uint8_t)slot);
-    if (bb_multi_mode()) { bb_runtime_state_t live; bb_state_get(&live); if (live.controller_connected) current_controller_index = live.controller_index; }
+    if (bb_multi_transport_mode()) { bb_runtime_state_t live; bb_state_get(&live); if (live.controller_connected) current_controller_index = live.controller_index; }
     hci_handler_impl(packet_type, channel, packet, size);
     bb_slot_enter(previous);
 }
@@ -2392,7 +2416,7 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
             const uint8_t* data = gap_event_advertising_report_get_data(packet);
             uint8_t data_len = gap_event_advertising_report_get_data_length(packet);
             gap_event_advertising_report_get_address(packet, addr);
-            if (bb_multi_mode() && slot_for_address(addr) >= 0) break;
+            if (bb_multi_transport_mode() && slot_for_address(addr) >= 0) break;
             adv_name(data, data_len, name, sizeof(name));
             bool hogp = ad_data_contains_uuid16(data_len, data, ORG_BLUETOOTH_SERVICE_HUMAN_INTERFACE_DEVICE);
             bool nso_new = ad_data_contains_uuid128(data_len, data, (uint8_t*)nintendo_service_uuid);
@@ -2488,7 +2512,6 @@ static void hci_handler_impl(uint8_t packet_type, uint16_t channel, uint8_t* pac
     }
 }
 
-static volatile bool multi_disconnect_requests[BB_MAX_SLOTS];
 static bool disconnect_current_impl(void);
 
 static volatile uint8_t pairing_command;
@@ -2512,7 +2535,7 @@ static void service_link_recovery(uint32_t now) {
 }
 
 static void service_slot(void) {
-    if (bb_multi_mode()) {
+    if (bb_multi_transport_mode()) {
         bb_runtime_state_t live;
         bb_state_get(&live);
         if (live.controller_connected) current_controller_index = live.controller_index;
@@ -2659,6 +2682,29 @@ static void service_slot(void) {
 }
 static void usb_watch_handler(btstack_timer_source_t* timer) {
     uint8_t previous = bb_slot_current();
+    if (recovery_command) {
+        recovery_until = btstack_run_loop_get_time_ms() + 5000u;
+        recovery_command = false;
+        pairing_command = 0;
+        pairing = false;
+        bb_state_set_pairing(false);
+        stop_scans();
+        gap_connectable_control(0);
+        gap_connect_cancel();
+        for (uint8_t i=0;i<(bb_multi_transport_mode()?BB_MAX_SLOTS:1);++i) {
+            bb_slot_enter(i);
+            multi_disconnect_requests[i] = false;
+            disconnect_current_impl();
+            if(pending_classic_handle!=HCI_CON_HANDLE_INVALID)gap_disconnect(pending_classic_handle);
+        }
+        bb_output_recover();
+        bb_slot_enter(previous);
+    }
+    if (recovery_until && !recovery_waiting()) {
+        recovery_until = 0;
+        gap_connectable_control(1);
+        start_scans();
+    }
     if (pairing_command) {
         uint8_t command = pairing_command;
         pairing_command = 0;
@@ -2681,7 +2727,7 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
     else if (usb_was_ready) {
         if (!usb_lost_since) usb_lost_since = now;
         if ((uint32_t)(now - usb_lost_since) >= 1500u) {
-            for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+            for (uint8_t i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
                 bb_slot_enter(i);
                 disconnect_current_impl();
             }
@@ -2689,11 +2735,11 @@ static void usb_watch_handler(btstack_timer_source_t* timer) {
             usb_lost_since = 0;
         }
     }
-    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    for (uint8_t i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_slot_enter(i);
         service_slot();
     }
-    if ((pairing || bb_multi_mode()) && !connection_in_progress() && free_slot() >= 0 && controller_transport_ready()) start_scans();
+    if ((pairing || bb_multi_transport_mode()) && !connection_in_progress() && free_slot() >= 0 && controller_transport_ready()) start_scans();
     bb_slot_enter(previous);
     btstack_run_loop_set_timer(timer, 100);
     btstack_run_loop_add_timer(timer);
@@ -2816,7 +2862,7 @@ static void stop_pairing_impl(void) {
 
 static void forget_all_impl(void) {
     uint8_t previous = bb_slot_current();
-    for (uint8_t i = 0; i < (bb_multi_mode() ? BB_MAX_SLOTS : 1); ++i) {
+    for (uint8_t i = 0; i < (bb_multi_transport_mode() ? BB_MAX_SLOTS : 1); ++i) {
         bb_slot_enter(i);
         if (classic_hid_cid) hid_host_disconnect(classic_hid_cid);
         if (le_handle != HCI_CON_HANDLE_INVALID) gap_disconnect(le_handle);
@@ -2851,6 +2897,11 @@ static bool forget_device_impl(const uint8_t address[6]) {
     }
     start_scans();
     return true;
+}
+
+void bb_bt_host_recover_output(void) {
+    // Run all Bluetooth operations on its run loop, rather than the USB core.
+    recovery_command = true;
 }
 
 bool bb_bt_host_disconnect_current(void) {
@@ -2910,12 +2961,7 @@ bool bb_bt_host_rumble_test(uint8_t strength, uint16_t duration_ms) {
 }
 
 void bb_bt_host_set_output_rumble(uint8_t left, uint8_t right) {
-    uint8_t strength = left > right ? left : right;
-    rumble_request_strength = strength;
-    rumble_request_big = left;
-    rumble_request_small = right;
-    rumble_request_duration_ms = strength ? 1200u : 50u;
-    rumble_request_pending = true;
+    bb_bt_host_set_slot_rumble(bb_output_slot(), left, right);
 }
 
 // strength drives single-strength controllers (unchanged behaviour); big/small drive controllers
